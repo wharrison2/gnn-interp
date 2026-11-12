@@ -19,10 +19,11 @@ DIGIT, OPERATOR, OTHER = 0, 1, 2  # coarse token classes (never token identity)
 
 @dataclass
 class Step:
-    """One arithmetic step: ``pos`` is the index of its final token in the full sequence."""
+    """One arithmetic step: ``pos`` is the index of its final token; ``prev_line`` the line before."""
 
     pos: int
     line: str
+    prev_line: str = ""
 
 
 def load_model(device: str | None = None, dtype: torch.dtype = torch.float32):
@@ -61,24 +62,27 @@ def generate(model, prompt: str, max_new_tokens: int = 128) -> torch.Tensor:
 def step_final_positions(tokens: torch.Tensor, tokenizer, n_prompt: int, prefix: str = "=") -> list[Step]:
     """Locate steps (completion lines starting with ``prefix``) and their final token positions.
 
-    Lines are split by decoding token-by-token; a line's final token is the last token before the
-    one containing its terminating newline (or the last generated token).
+    Text is split into lines by decoding token-by-token (index 0 is BOS and skipped). A step's
+    final token is the last digit-containing token on its line; ``prev_line`` is the previous
+    non-empty line (prompt lines included), so the first step sees the problem statement.
     """
-    steps, line, last = [], "", None
-    for i in range(n_prompt, len(tokens)):
-        piece = tokenizer.decode(tokens[i])
-        if "\n" in piece:
-            head = piece.split("\n", 1)[0]
-            if head.strip():  # newline glued onto content: this token ends the line
-                line, last = line + head, i
-            if line.strip().startswith(prefix) and last is not None:
-                steps.append(Step(last, line.strip()))
-            line, last = piece.rsplit("\n", 1)[1], (i if piece.rsplit("\n", 1)[1].strip() else None)
-        else:
-            line += piece
-            last = i if piece.strip() else last
-    if line.strip().startswith(prefix) and last is not None:
-        steps.append(Step(last, line.strip()))
+    lines, cur, last = [], "", None
+    for i in range(1, len(tokens)):
+        for j, part in enumerate(tokenizer.decode(tokens[i]).split("\n")):
+            if j:  # a newline closed the current line
+                lines.append((cur.strip(), last))
+                cur, last = "", None
+            cur += part
+            if any(c.isdigit() for c in part):
+                last = i
+    lines.append((cur.strip(), last))
+
+    steps, prev = [], ""
+    for text, pos in lines:
+        if text.startswith(prefix) and pos is not None and pos >= n_prompt:
+            steps.append(Step(pos, text, prev))
+        if text:
+            prev = text
     return steps
 
 
@@ -107,7 +111,7 @@ def token_class_table(tokenizer) -> torch.Tensor:
 def run_problems(model, prompts: dict[str, str], out_dir: str | Path, max_new_tokens: int = 128) -> list[dict]:
     """Generate on each prompt and save one record per problem to ``out_dir/{problem_id}.pt``.
 
-    Record: ``{problem_id, prompt, tokens, n_prompt, steps: [{pos, line, error_norms}]}`` where
+    Record: ``{problem_id, prompt, tokens, n_prompt, steps: [{pos, line, prev_line, error_norms}]}`` where
     ``error_norms`` is (n_layers, pos), matching the graph input ``tokens[:pos]``.
     """
     out_dir = Path(out_dir)
@@ -118,7 +122,7 @@ def run_problems(model, prompts: dict[str, str], out_dir: str | Path, max_new_to
         n_prompt = len(model.ensure_tokenized(prompt))
         norms = error_norms(model, tokens)
         steps = [
-            {"pos": s.pos, "line": s.line, "error_norms": norms[:, : s.pos].clone()}
+            {"pos": s.pos, "line": s.line, "prev_line": s.prev_line, "error_norms": norms[:, : s.pos].clone()}
             for s in step_final_positions(tokens, model.tokenizer, n_prompt)
         ]
         rec = {"problem_id": pid, "prompt": prompt, "tokens": tokens, "n_prompt": n_prompt, "steps": steps}
