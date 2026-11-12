@@ -57,7 +57,10 @@ def _val_score(model, val, cfg: TrainConfig, pos_weight: torch.Tensor) -> float:
 
 
 def fit_gnn(model, train, val, cfg: TrainConfig = TrainConfig()):
-    """Train with class-weighted BCE and AdamW; early-stop on ``val`` and restore the best weights."""
+    """Train with class-weighted BCE and AdamW; early-stop on ``val`` and restore the best weights.
+
+    Sets ``model.epochs_run`` (epochs trained before stopping).
+    """
     y = _labels(train)
     pos_weight = (len(y) - y.sum()) / y.sum().clamp_min(1)  # n_neg / n_pos (positive = incorrect)
     loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(cfg.device))
@@ -66,7 +69,7 @@ def fit_gnn(model, train, val, cfg: TrainConfig = TrainConfig()):
     model.to(cfg.device)
 
     best, best_state, stale = -np.inf, copy.deepcopy(model.state_dict()), 0
-    for _ in range(cfg.max_epochs):
+    for model.epochs_run in range(1, cfg.max_epochs + 1):
         model.train()
         for b in loader:
             b = b.to(cfg.device)
@@ -89,6 +92,7 @@ def gnn_fit_predict(data_list, model_kwargs: dict, cfg: TrainConfig = TrainConfi
     Per fold: an inner label-stratified, problem-grouped validation split (~``val_frac``) for early stopping; a copy of ``pca``
     (if given, with the decoder ``fetch``er) and a ``FeatureNormalizer``, both fit on the inner
     training graphs only. Without ``pca`` the decoder-PCA columns are used as they are in ``data_list``.
+    ``fit_predict.epochs`` collects each fit's ``epochs_run``.
     """
     assert (pca is None) == (fetch is None), "pass pca and fetch together"
     groups = np.array([d.problem_id for d in data_list])
@@ -106,8 +110,10 @@ def gnn_fit_predict(data_list, model_kwargs: dict, cfg: TrainConfig = TrainConfi
         norm = FeatureNormalizer().fit(train)
         train, val, test = (norm.apply(part) for part in (train, val, test))
         model = fit_gnn(GraphClassifier(**model_kwargs), train, val, cfg)
+        fit_predict.epochs.append(model.epochs_run)
         return predict(model, test, cfg.batch_size, cfg.device)
 
+    fit_predict.epochs = []
     return fit_predict
 
 

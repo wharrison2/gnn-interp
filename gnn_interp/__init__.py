@@ -9,6 +9,7 @@ Modules:
     baselines   -- non-GNN baselines (size, probability, operand+answer, CRV-style GBM, hybrid).
     train       -- training loop and grouped cross-validation harness.
     metrics     -- AUROC, AUPR, FPR@95TPR, accuracy, precision, recall.
+    experiments -- calibration runs sizing the real run (memory, class balance, graph size, GNN time).
 """
 import os
 

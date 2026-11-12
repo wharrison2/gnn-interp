@@ -10,6 +10,10 @@ Predict whether an arithmetic step written by Gemma 2 2B is correct, from its at
 - `baselines`: non-graph baselines for comparison.
 - `train`: training and evaluation loops.
 - `metrics`: classification metrics (positive class = incorrect step).
+- `problems`: arithmetic problem generation, few-shot prompts, step grading (labels).
+- `attribution`: build + prune attribution graphs per labelled step, write the dataset manifest.
+- `experiments`: calibration runs that size the real run (memory, class balance, attribution time and graph
+  size, GNN epoch time, CV dry run); `python -m gnn_interp.experiments --help`.
 
 ## Install
 ```

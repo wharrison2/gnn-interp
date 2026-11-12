@@ -26,11 +26,14 @@ class Step:
     prev_line: str = ""
 
 
-def load_model(device: str | None = None, dtype: torch.dtype = torch.float32):
-    """Load the circuit-tracer ``ReplacementModel`` (Gemma 2 2B with GemmaScope transcoders)."""
+def load_model(device: str | None = None, dtype: torch.dtype = torch.float32, **kwargs):
+    """Load the circuit-tracer ``ReplacementModel`` (Gemma 2 2B with GemmaScope transcoders).
+
+    ``kwargs`` go to ``ReplacementModel.from_pretrained`` (e.g. ``lazy_encoder``, ``lazy_decoder``).
+    """
     from circuit_tracer import ReplacementModel
 
-    return ReplacementModel.from_pretrained(MODEL_NAME, TRANSCODER_SET, device=device, dtype=dtype)
+    return ReplacementModel.from_pretrained(MODEL_NAME, TRANSCODER_SET, device=device, dtype=dtype, **kwargs)
 
 
 def load_transcoders(device: str = "cpu"):
