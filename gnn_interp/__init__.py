@@ -1,6 +1,7 @@
 """Predicting arithmetic-step correctness from attribution graphs with GNNs.
 
 Modules:
+    problems    -- arithmetic problem generation, few-shot prompts, step grading (labels).
     gemma       -- load Gemma 2 2B + GemmaScope transcoders, generate, locate steps, error norms.
     graph_data  -- convert circuit-tracer Graphs to PyG Data (features, PCA, normalization, ablations).
     models      -- GNN / DeepSets classifiers.
