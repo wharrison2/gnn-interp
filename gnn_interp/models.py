@@ -62,7 +62,7 @@ class GraphClassifier(nn.Module):
     top-1 logit node ("anchor"), mean, max, or the concatenation of all three ("all").
     """
 
-    def __init__(self, type_dims: list[int], conv: str = "graphconv", hidden: int = 64, n_conv: int = 2,
+    def __init__(self, type_dims: list[int], conv: str = "graphconv", hidden: int = 32, n_conv: int = 2,
                  dropout: float = 0.2, edge_dropout: float = 0.1, readout: str = "all",
                  n_model_layers: int = 26, max_pos: int = 64):
         super().__init__()
