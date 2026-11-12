@@ -1,0 +1,8 @@
+torch
+torch_geometric
+scikit-learn
+networkx
+numpy
+transformers
+pytest
+circuit-tracer @ git+https://github.com/safety-research/circuit-tracer.git
