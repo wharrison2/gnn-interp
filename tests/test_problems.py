@@ -51,7 +51,16 @@ def test_generate_problems():
         assert sum(p.expression.count(c) for c in "+-*") == 4
         assert p.value == P.evaluate(p.expression) and 0 <= p.value <= 999
         assert p.prompt == P.make_prompt(p.expression)
-    assert ps[0].problem_id == "op4_s3_00000"
+    assert ps[0].problem_id.startswith("op4_") and ps[0].problem_id.endswith("_s3_00000")
+
+
+def test_problem_ids_unique_across_settings():
+    """Same n_ops and seed, different operand ranges (e.g. two difficulty levels): IDs must not collide."""
+    a = P.generate_problems(5, 3, seed=0, operand_range=(1, 20))
+    b = P.generate_problems(5, 3, seed=0, operand_range=(1, 50))
+    assert not {p.problem_id for p in a} & {p.problem_id for p in b}
+    assert [p.problem_id for p in a] == [p.problem_id for p in P.generate_problems(5, 3, seed=0)]  # stable
+    assert P.generate_problems(2, 3, id_prefix="easy")[1].problem_id == "easy_00001"
 
 
 def test_generate_problems_impossible_constraints():

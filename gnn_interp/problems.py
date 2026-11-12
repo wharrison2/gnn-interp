@@ -14,6 +14,7 @@ INTERFACE.md); later steps are kept for analysis with ``label=None`` (CRV's stat
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import random
 from dataclasses import asdict, dataclass
@@ -130,14 +131,24 @@ def _intermediates(t) -> list[int]:
     return _intermediates(t[1]) + _intermediates(t[2]) + [_eval_tree(t)]
 
 
+def _settings_hash(**settings) -> str:
+    """Short stable hash of the generation settings (unlike ``hash()``, the same across processes)."""
+    return hashlib.sha1(repr(sorted(settings.items())).encode()).hexdigest()[:6]
+
+
 def generate_problems(n: int, n_ops: int, seed: int = 0, operand_range: tuple[int, int] = (1, 20),
                       ops: str = "+-*", max_abs: int = 999, allow_negative: bool = False,
-                      max_tries: int = 1000) -> list[Problem]:
+                      max_tries: int = 1000, id_prefix: str | None = None) -> list[Problem]:
     """Sample ``n`` distinct expressions with ``n_ops`` operators.
 
     Rejects expressions with any intermediate value above ``max_abs`` in magnitude, or below zero unless
-    ``allow_negative``. IDs are ``op{n_ops}_s{seed}_{i:05d}``, so (n_ops, seed) pairs never collide.
+    ``allow_negative``. IDs are ``{id_prefix}_{i:05d}``; the default prefix ``op{n_ops}_{hash}_s{seed}``
+    hashes all generation settings, so different settings never produce the same ID.
     """
+    if id_prefix is None:
+        h = _settings_hash(n_ops=n_ops, operand_range=tuple(operand_range), ops=ops, max_abs=max_abs,
+                           allow_negative=allow_negative)
+        id_prefix = f"op{n_ops}_{h}_s{seed}"
     rng, seen, out = random.Random(seed), set(), []
     for _ in range(n * max_tries):
         if len(out) == n:
@@ -147,7 +158,7 @@ def generate_problems(n: int, n_ops: int, seed: int = 0, operand_range: tuple[in
         if expr in seen or any(abs(v) > max_abs or (v < 0 and not allow_negative) for v in vals):
             continue
         seen.add(expr)
-        pid = f"op{n_ops}_s{seed}_{len(out):05d}"
+        pid = f"{id_prefix}_{len(out):05d}"
         out.append(Problem(pid, expr, _eval_tree(t), n_ops, make_prompt(expr)))
     if len(out) < n:
         raise RuntimeError(f"only found {len(out)}/{n} expressions; loosen the constraints")
