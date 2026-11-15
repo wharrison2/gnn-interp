@@ -64,9 +64,13 @@ def generate(model, prompt: str, max_new_tokens: int = 128) -> tuple[torch.Tenso
     chat = is_chat(model)
     eot = model.tokenizer.convert_tokens_to_ids("<end_of_turn>") if chat else None
     stop_ids = {eot, model.tokenizer.eos_token_id} if chat else set()
-    out = model.generate(  # chat: stop at <end_of_turn> (TransformerLens takes one stop id)
+    # Early stop (TransformerLens takes one id): chat at <end_of_turn>; base at the single "\n\n" token if the
+    # vocab has one (else it runs to max_new_tokens). Truncation below is the same either way.
+    blank = model.tokenizer.encode("\n\n", add_special_tokens=False)
+    stop = eot if chat else (blank[0] if len(blank) == 1 else None)
+    out = model.generate(
         tokens[None], max_new_tokens=max_new_tokens, do_sample=False, return_type="tokens", verbose=False,
-        **({"eos_token_id": eot} if chat else {}),
+        **({"eos_token_id": stop} if stop is not None else {}),
     )[0].cpu()
     text = ""
     for i in range(len(tokens), len(out)):

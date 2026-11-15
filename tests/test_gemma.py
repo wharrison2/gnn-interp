@@ -66,6 +66,7 @@ class FakeGenModel:
         self.tokenizer = FakeTok(["<bos>", "=5", "\n", "\n\n", "<end_of_turn>"])
         self.tokenizer.convert_tokens_to_ids = lambda t: 4
         self.tokenizer.eos_token_id = 0
+        self.tokenizer.encode = lambda text, add_special_tokens: [3] if text == "\n\n" else [9, 9]
         self.kwargs = None
 
     def ensure_tokenized(self, prompt):
@@ -81,7 +82,7 @@ def test_generate_stops_base_and_chat():
 
     base = FakeGenModel("gemma-2-2b", [1, 2, 3, 1])
     tokens, complete = generate(base, "p")
-    assert tokens.tolist() == [0, 1, 1, 2, 3] and complete and "eos_token_id" not in base.kwargs
+    assert tokens.tolist() == [0, 1, 1, 2, 3] and complete and base.kwargs["eos_token_id"] == 3
     chat = FakeGenModel("gemma-2-2b-it", [1, 3, 1, 4, 1])  # a blank line does not end a chat reply
     tokens, complete = generate(chat, "p")
     assert tokens.tolist() == [0, 1, 1, 3, 1] and complete and chat.kwargs["eos_token_id"] == 4
