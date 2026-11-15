@@ -28,7 +28,25 @@ def make_graph(rng: np.random.Generator, shift: float = 0.0, n_feat: int = 12) -
         adjacency_matrix=adj, cfg=SimpleNamespace(n_layers=N_LAYERS), n_pos=N_POS,
         selected_features=torch.arange(n_feat), logit_targets=list(range(N_LOGIT)),
         active_features=active, activation_values=torch.from_numpy(rng.normal(shift, 1, n_feat)).float(),
-        input_tokens=torch.from_numpy(rng.integers(0, VOCAB, N_POS)), logit_probabilities=probs)
+        input_tokens=torch.from_numpy(rng.integers(0, VOCAB, N_POS)), logit_probabilities=probs,
+        logit_token_ids=torch.arange(N_LOGIT))
+
+
+def make_layered_graph(rng: np.random.Generator, n_feat: int = 200, density: float = 0.3) -> SimpleNamespace:
+    """``make_graph`` with real attribution-graph structure: tokens feed features/errors/logits, and a
+    feature or error at (layer l, pos p) feeds features at a later layer and position >= p, and the logits."""
+    g = make_graph(rng, n_feat=n_feat)
+    feat_layer, feat_pos = g.active_features[:, 0], g.active_features[:, 1]
+    err_layer, err_pos = torch.arange(N_LAYERS).repeat_interleave(N_POS), torch.arange(N_POS).repeat(N_LAYERS)
+    layer = torch.cat([feat_layer, err_layer, torch.full((N_POS,), -1), torch.full((N_LOGIT,), N_LAYERS)])
+    pos = torch.cat([feat_pos, err_pos, torch.arange(N_POS), torch.full((N_LOGIT,), N_POS - 1)])
+    is_feat_tgt = torch.arange(len(layer)) < n_feat
+    is_logit = torch.arange(len(layer)) >= len(layer) - N_LOGIT
+    allowed = ((is_feat_tgt | is_logit)[:, None] & (layer[:, None] > layer[None, :])
+               & (pos[:, None] >= pos[None, :]) & ~is_logit[None, :])
+    w = torch.from_numpy(rng.normal(size=allowed.shape) * (rng.random(allowed.shape) < density)).float()
+    g.adjacency_matrix = w * allowed
+    return g
 
 
 def to_data(graph, label: int, rng: np.random.Generator, **kw):

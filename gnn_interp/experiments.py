@@ -187,9 +187,11 @@ def summarize_balance(rows: list[dict]) -> dict:
 def graph_stats(graph, thresholds=THRESHOLDS) -> dict:
     """Unpruned size, and kept nodes (by type) / edges after ``prune_graph`` at each threshold.
 
-    ``edges_node_pruned``: all edges among the kept nodes (at the loosest node threshold this is
-    ``attribution.save_compact``'s edge set);
-    ``edges``: edges after the edge prune too. ``*_mb`` assume sparse COO (int64 x2 + fp32 = 20 B/edge).
+    ``edges_node_pruned``: all edges among the kept nodes; ``edges``: edges after the edge prune too.
+    ``*_mb`` assume sparse COO (int64 x2 + fp32 = 20 B/edge).
+    ``sparse``: ``attribution.save_compact`` file (default range): stored nodes, all edges among them,
+    stored edges, serialized MB; and node / edge Jaccard of ``attribution.prune`` (full-graph edge
+    scoring) vs circuit-tracer's ``prune_graph`` at ``DEFAULT_THRESHOLD``.
     """
     from circuit_tracer.graph import prune_graph
 
@@ -210,7 +212,19 @@ def graph_stats(graph, thresholds=THRESHOLDS) -> dict:
         out["pruned"][f"{nt}/{et}"] = {"nodes": int(node_mask.sum()), **types, "edges_node_pruned": n_node_pruned,
                                        "edges": n_edges, "node_pruned_mb": n_node_pruned * 20 / 1e6,
                                        "pruned_mb": n_edges * 20 / 1e6}
+    sp = attribution.sparsify(graph)
+    gi = sp["node_index"].long()
+    ct, ours = prune_graph(graph, *DEFAULT_THRESHOLD), attribution.prune(graph, *DEFAULT_THRESHOLD)
+    ct_edges = ct.edge_mask.cpu() & nz
+    out["sparse"] = {"nodes": len(gi), "edges_among_stored": int(nz[gi][:, gi].sum()),
+                     "edges_stored": sp["edge_index"].shape[1], "mb": attribution.nbytes(sp) / 1e6,
+                     "node_jaccard_vs_ct": _jaccard(ct.node_mask.cpu(), ours.node_mask),
+                     "edge_jaccard_vs_ct": _jaccard(ct_edges, ours.edge_mask)}
     return out
+
+
+def _jaccard(a: torch.Tensor, b: torch.Tensor) -> float:
+    return int((a & b).sum()) / max(int((a | b).sum()), 1)
 
 
 def _kept_feature_keys(graph, threshold=DEFAULT_THRESHOLD) -> set:
@@ -264,7 +278,7 @@ def graph_sizes(model, steps_dir: Path, out_dir: Path, n: int, max_feature_nodes
                 ref = _kept_feature_keys(graph)
                 row["top1_is_generated"] = int(graph.logit_token_ids[0]) == int(tokens[pos])
                 if save_data:
-                    node_mask, edge_mask, _ = attribution.prune(graph, *DEFAULT_THRESHOLD)
+                    node_mask, edge_mask = attribution.prune(graph, *DEFAULT_THRESHOLD)
                     rs = rec["steps"][key[1]]
                     d = graph_to_data(graph, step["label"], rs["error_norms"], token_classes,
                                       node_mask=node_mask, edge_mask=edge_mask)
@@ -292,6 +306,7 @@ def summarize_sizes(rows: list[dict]) -> dict:
                     for k in ("seconds", "peak_gb", "n_pos", "n_active", "n_feat", "n_nodes", "nnz", "dense_mb")}
         if "jaccard_vs_ref" in s[0]:
             out[cap]["jaccard_vs_ref"] = _quantiles([x["jaccard_vs_ref"] for x in s])
+        out[cap]["sparse"] = {k: _quantiles([x["sparse"][k] for x in s]) for k in s[0]["sparse"]}
         out[cap]["pruned"] = {th: {k: _quantiles([x["pruned"][th][k] for x in s]) for k in s[0]["pruned"][th]}
                               for th in s[0]["pruned"]}
     return out

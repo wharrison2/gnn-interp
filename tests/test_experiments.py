@@ -40,6 +40,9 @@ def test_graph_stats_counts():
         assert p["feature"] + p["error"] + p["token"] + p["logit"] == p["nodes"]
         assert p["token"] == g.n_pos and p["edges"] <= p["edges_node_pruned"]
     assert default["nodes"] <= loose["nodes"]
+    sp = s["sparse"]
+    assert sp["edges_stored"] <= sp["edges_among_stored"] and sp["mb"] > 0
+    assert 0 <= sp["node_jaccard_vs_ct"] <= 1 and 0 <= sp["edge_jaccard_vs_ct"] <= 1
 
 
 @pytest.mark.slow

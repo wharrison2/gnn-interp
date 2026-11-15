@@ -56,8 +56,8 @@ def graph_to_data(
         label: 1 if the step is incorrect, else 0.
         error_norms: (n_layers, n_pos) transcoder error norms for the graph's input.
         token_classes: vocab-sized table from ``gemma.token_class_table``.
-        node_mask, edge_mask: a saved ``PruneResult``'s masks. If absent, ``prune=True`` prunes
-            here with circuit-tracer defaults; otherwise every node and edge is kept.
+        node_mask, edge_mask: saved ``attribution.prune`` masks. If absent, ``prune=True`` prunes here
+            with ``attribution.prune`` defaults; otherwise every node and edge is kept.
         max_pos: positions are counted back from the last token and clamped to ``max_pos - 1``.
 
     Extra attributes: ``node_type``, ``layer_idx`` (0 = embedding, l+1 = layer l, L+1 = logits),
@@ -67,62 +67,89 @@ def graph_to_data(
     """
     adj = graph.adjacency_matrix.float().cpu()
     n = adj.shape[0]
-    n_layers, n_pos = graph.cfg.n_layers, graph.n_pos
     n_feat, n_logit = len(graph.selected_features), len(graph.logit_targets)
-    n_err = n_layers * n_pos
-    assert tuple(error_norms.shape) == (n_layers, n_pos), (error_norms.shape, n_layers, n_pos)
-    assert n == n_feat + n_err + n_pos + n_logit
-
+    assert n == n_feat + (graph.cfg.n_layers + 1) * graph.n_pos + n_logit
     if node_mask is None and prune:
-        from circuit_tracer.graph import prune_graph
+        from .attribution import prune as prune_masks
 
-        node_mask, edge_mask, _ = prune_graph(graph)
+        node_mask, edge_mask = prune_masks(graph)
     node_mask = torch.ones(n, dtype=torch.bool) if node_mask is None else node_mask.cpu().bool()
     logit_probs = graph.logit_probabilities.float().cpu()
-    influence = _node_influence(adj, logit_probs)
 
-    # Per-node metadata over the full node set.
-    ntype = torch.cat([torch.full((k,), t) for k, t in
-                       [(n_feat, FEATURE), (n_err, ERROR), (n_pos, TOKEN), (n_logit, LOGIT)]])
-    feats = graph.active_features[graph.selected_features].cpu().long()  # (n_feat, 3): layer, pos, id
-    acts = graph.activation_values.float().cpu()[graph.selected_features.cpu()]  # indexed like active_features
-    err_layer = torch.arange(n_layers).repeat_interleave(n_pos)
-    err_pos = torch.arange(n_pos).repeat(n_layers)
-    layer = torch.cat([feats[:, 0] + 1, err_layer + 1, torch.zeros(n_pos, dtype=torch.long),
-                       torch.full((n_logit,), n_layers + 1)])
-    pos = torch.cat([feats[:, 1], err_pos, torch.arange(n_pos), torch.full((n_logit,), n_pos - 1)])
-
-    x = torch.zeros(n, max(type_dims(n_pca)))
-    f, e, t, lg = (ntype == k for k in range(N_TYPES))
-    x[f, 0], x[f, 1] = acts, influence[f]
-    x[e, 0], x[e, 1] = influence[e], error_norms.float().flatten()
-    x[t, 0] = influence[t]
-    x[t, 1:1 + N_TOKEN_CLASSES] = torch.eye(N_TOKEN_CLASSES)[token_classes[graph.input_tokens.cpu().long()]]
-    x[lg, :TOP_K] = torch.eye(TOP_K)[torch.arange(n_logit).clamp(max=TOP_K - 1)]
-
-    # Restrict to kept nodes and edges; edges point source (column) -> target (row).
     keep = node_mask.nonzero().squeeze(1)
-    assert node_mask[n - n_logit], "the top-1 logit node (readout anchor) must be kept"
     w = adj[keep][:, keep]
     if edge_mask is not None:
         w = w * edge_mask.cpu().bool()[keep][:, keep]
     dst, src = w.nonzero(as_tuple=True)
-    weight = w[dst, src]
+    sel = graph.selected_features.cpu()[keep[keep < n_feat]]
+    return _make_data(
+        keep, n, n_feat, graph.cfg.n_layers, graph.active_features.cpu()[sel].long(),
+        graph.activation_values.float().cpu()[sel], _node_influence(adj, logit_probs)[keep],
+        graph.input_tokens.cpu(), logit_probs, src, dst, w[dst, src],
+        label, error_norms, token_classes, n_pca, max_pos)
+
+
+def compact_to_data(sp: dict, label: int, error_norms: torch.Tensor, token_classes: torch.Tensor,
+                    n_pca: int = 8, node_threshold: float = 0.8, edge_threshold: float = 0.98,
+                    max_pos: int = 64) -> Data:
+    """``graph_to_data`` for an ``attribution.sparsify`` dict, re-pruned at the given thresholds.
+
+    Equals ``graph_to_data(graph, ..., *attribution.prune(graph, node_threshold, edge_threshold))``.
+    """
+    from .attribution import reprune
+
+    node_mask, edge_mask = reprune(sp, node_threshold, edge_threshold)
+    keep = node_mask.nonzero().squeeze(1)
+    new_id = node_mask.long().cumsum(0) - 1
+    src, dst = sp["edge_index"].long()[:, edge_mask]
+    n_stored_feat = len(sp["feature_ids"])  # stored features come first in stored-node order
+    return _make_data(
+        sp["node_index"].long()[keep], sp["n_nodes"], sp["n_features"], sp["n_layers"],
+        sp["feature_ids"].long()[node_mask[:n_stored_feat]], sp["activations"].float()[node_mask[:n_stored_feat]],
+        sp["influence"].float()[keep], sp["input_tokens"], sp["logit_probabilities"].float(),
+        new_id[src], new_id[dst], sp["edge_weight"].float()[edge_mask],
+        label, error_norms, token_classes, n_pca, max_pos)
+
+
+def _make_data(gi, n, n_feat, n_layers, feats, acts, influence, input_tokens, logit_probs, src, dst, weight,
+               label, error_norms, token_classes, n_pca, max_pos) -> Data:
+    """Shared builder. ``gi``: kept nodes' global indices (sorted); ``feats`` (layer, pos, id) and ``acts``
+    for the kept feature nodes; ``src``/``dst``/``weight``: kept edges in kept-node indices."""
+    n_pos, n_logit = len(input_tokens), len(logit_probs)
+    n_err = n_layers * n_pos
+    assert tuple(error_norms.shape) == (n_layers, n_pos), (error_norms.shape, n_layers, n_pos)
+    anchor = (gi == n - n_logit).nonzero().view(-1)
+    assert len(anchor) == 1, "the top-1 logit node (readout anchor) must be kept"
+
+    ntype = torch.bucketize(gi, torch.tensor([n_feat, n_feat + n_err, n - n_logit]), right=True)
+    f, e, t, lg = (ntype == k for k in range(N_TYPES))
+    layer, pos = torch.zeros_like(gi), torch.zeros_like(gi)
+    layer[f], pos[f] = feats[:, 0] + 1, feats[:, 1]
+    err = gi[e] - n_feat
+    layer[e], pos[e] = err // n_pos + 1, err % n_pos
+    pos[t] = gi[t] - n_feat - n_err
+    layer[lg], pos[lg] = n_layers + 1, n_pos - 1
+
+    x = torch.zeros(len(gi), max(type_dims(n_pca)))
+    x[f, 0], x[f, 1] = acts, influence[f]
+    x[e, 0], x[e, 1] = influence[e], error_norms.float().flatten()[err]
+    x[t, 0] = influence[t]
+    x[t, 1:1 + N_TOKEN_CLASSES] = torch.eye(N_TOKEN_CLASSES)[token_classes[input_tokens.long()[pos[t]]]]
+    x[lg, :TOP_K] = torch.eye(TOP_K)[(gi[lg] - (n - n_logit)).clamp(max=TOP_K - 1)]
+
     scale = weight.abs().max().item() if weight.numel() else 1.0
     probs = torch.zeros(1, TOP_K)
     probs[0, : min(n_logit, TOP_K)] = logit_probs[:TOP_K]
-
-    kept_feat = keep[keep < n_feat]
     return Data(
-        x=x[keep],
+        x=x,
         edge_index=torch.stack([src, dst]),
         edge_weight=weight / scale,
         w_scale=torch.tensor([scale]),
-        node_type=ntype[keep],
-        layer_idx=layer[keep],
-        pos_idx=(n_pos - 1 - pos[keep]).clamp(0, max_pos - 1),
-        anchor_index=(keep == n - n_logit).nonzero().view(1),
-        feat_key=torch.stack([feats[kept_feat, 0], feats[kept_feat, 2]], 1),
+        node_type=ntype,
+        layer_idx=layer,
+        pos_idx=(n_pos - 1 - pos).clamp(0, max_pos - 1),
+        anchor_index=anchor,
+        feat_key=torch.stack([feats[:, 0], feats[:, 2]], 1),
         logit_probs=probs,
         y=torch.tensor([float(label)]),
     )
@@ -273,12 +300,14 @@ def ablate(data: Data, mode: str, seed: int = 0) -> Data:
 # --------------------------------------------------------------------------------------------
 
 def load_dataset(manifest: str | Path, records_dir: str | Path, token_classes: torch.Tensor,
-                 n_pca: int = 8, prune: bool = False) -> list[Data]:
+                 n_pca: int = 8, prune: bool = False, node_threshold: float = 0.8,
+                 edge_threshold: float = 0.98) -> list[Data]:
     """Load every graph listed in a manifest (jsonl; see INTERFACE.md).
 
-    Rows: ``{graph_path, problem_id, step_idx, label[, mask_path]}``, paths relative to the
-    manifest. ``mask_path`` holds ``{"node_mask", "edge_mask"}``. Error norms and the step text
-    come from ``records_dir/{problem_id}.pt`` (written by ``gemma.run_problems``).
+    Rows: ``{graph_path, problem_id, step_idx, label[, mask_path, storage]}``, paths relative to the
+    manifest. "full" rows (the default): ``mask_path`` holds ``{"node_mask", "edge_mask"}``, else
+    ``prune`` applies. "compact" rows are re-pruned at ``node_threshold``/``edge_threshold``.
+    Error norms and the step text come from ``records_dir/{problem_id}.pt`` (``gemma.run_problems``).
     """
     from circuit_tracer.graph import Graph
 
@@ -289,11 +318,15 @@ def load_dataset(manifest: str | Path, records_dir: str | Path, token_classes: t
         if pid not in records:
             records[pid] = torch.load(records_dir / f"{pid}.pt", weights_only=False)
         step = records[pid]["steps"][row["step_idx"]]
-        masks = (torch.load(manifest.parent / row["mask_path"], weights_only=False)
-                 if row.get("mask_path") else {})
-        d = graph_to_data(Graph.from_pt(str(manifest.parent / row["graph_path"])), row["label"],
-                          step["error_norms"], token_classes, n_pca,
-                          masks.get("node_mask"), masks.get("edge_mask"), prune)
+        path = manifest.parent / row["graph_path"]
+        if row.get("storage", "full") == "compact":
+            d = compact_to_data(torch.load(path, weights_only=False), row["label"], step["error_norms"],
+                                token_classes, n_pca, node_threshold, edge_threshold)
+        else:
+            masks = (torch.load(manifest.parent / row["mask_path"], weights_only=False)
+                     if row.get("mask_path") else {})
+            d = graph_to_data(Graph.from_pt(str(path)), row["label"], step["error_norms"], token_classes,
+                              n_pca, masks.get("node_mask"), masks.get("edge_mask"), prune)
         d.problem_id, d.step_idx = pid, row["step_idx"]
         d.line, d.prev_line = step["line"], step.get("prev_line", "")
         out.append(d)
