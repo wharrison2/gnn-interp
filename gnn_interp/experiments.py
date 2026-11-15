@@ -391,7 +391,7 @@ def precision_check(steps_dir: Path, n: int = 10, dtypes=("float32", "bfloat16")
         model = gemma.load_model("cuda" if _cuda() else None, DTYPES[dtype])
         rows = []
         for st, rec in steps:
-            gen = gemma.generate(model, rec["prompt"], max_new_tokens)
+            gen, _ = gemma.generate(model, rec["prompt"], max_new_tokens)
             _reset_peak()
             t = time.perf_counter()
             graph = attribution.build_graph(model, rec["tokens"], st["pos"], max_feature_nodes=max_feature_nodes,
@@ -538,6 +538,7 @@ def main(argv=None):
     ap.add_argument("--steps", type=Path, help="batch/precision/sizes/probe: the balance output directory")
     ap.add_argument("--data", type=Path, help="gnn/cv: data.pt written by sizes")
     ap.add_argument("--dtype", default="float32", choices=list(DTYPES))
+    ap.add_argument("--model", default="base", choices=list(gemma.MODELS), help="balance/batch/sizes: base or instruct")
     ap.add_argument("--caps", type=int, nargs="+", default=[8192, 4096, 2048], help="sizes: max_feature_nodes")
     ap.add_argument("--batch-size", type=int, default=256, help="attribution batch size (lower if OOM)")
     ap.add_argument("--batch-sizes", type=int, nargs="+", default=[64, 256, 512, 1024], help="batch: sizes to time")
@@ -552,7 +553,7 @@ def main(argv=None):
     elif a.experiment == "probe":
         result = probe_baseline(a.steps)
     elif a.experiment in ("balance", "batch", "sizes"):
-        model = gemma.load_model("cuda" if _cuda() else None, DTYPES[a.dtype])
+        model = gemma.load_model("cuda" if _cuda() else None, DTYPES[a.dtype], gemma.MODELS[a.model])
         if a.experiment == "balance":
             result = class_balance(model, a.out, a.n, a.levels)
         elif a.experiment == "batch":

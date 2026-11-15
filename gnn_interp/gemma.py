@@ -11,7 +11,10 @@ from pathlib import Path
 
 import torch
 
-MODEL_NAME = "google/gemma-2-2b"
+MODELS = {"base": "google/gemma-2-2b", "instruct": "google/gemma-2-2b-it"}  # both use the base-model transcoders
+MODEL_NAME = MODELS["base"]
+# Gemma 2 chat turn (BOS is prepended by ``ensure_tokenized``); the reply ends with <end_of_turn>.
+CHAT_TEMPLATE = "<start_of_turn>user\n{}<end_of_turn>\n<start_of_turn>model\n"
 TRANSCODER_SET = "mntss/gemma-scope-transcoders"
 OPERATORS = set("+-*/=()")
 DIGIT, OPERATOR, OTHER = 0, 1, 2  # coarse token classes (never token identity)
@@ -26,14 +29,21 @@ class Step:
     prev_line: str = ""
 
 
-def load_model(device: str | None = None, dtype: torch.dtype = torch.float32, **kwargs):
-    """Load the circuit-tracer ``ReplacementModel`` (Gemma 2 2B with GemmaScope transcoders).
+def load_model(device: str | None = None, dtype: torch.dtype = torch.float32, model_name: str = MODEL_NAME,
+               **kwargs):
+    """Load the circuit-tracer ``ReplacementModel`` (Gemma 2 2B, base or ``-it``, with GemmaScope transcoders).
 
+    The transcoders were trained on the base model; on ``-it`` expect larger errors (measured by ``experiments``).
     ``kwargs`` go to ``ReplacementModel.from_pretrained`` (e.g. ``lazy_encoder``, ``lazy_decoder``).
     """
     from circuit_tracer import ReplacementModel
 
-    return ReplacementModel.from_pretrained(MODEL_NAME, TRANSCODER_SET, device=device, dtype=dtype, **kwargs)
+    return ReplacementModel.from_pretrained(model_name, TRANSCODER_SET, device=device, dtype=dtype, **kwargs)
+
+
+def is_chat(model) -> bool:
+    """Instruction-tuned model: prompts go in a chat turn and the reply ends at <end_of_turn>."""
+    return model.cfg.model_name.endswith("-it")
 
 
 def load_transcoders(device: str = "cpu"):
@@ -44,22 +54,28 @@ def load_transcoders(device: str = "cpu"):
 
 
 @torch.no_grad()
-def generate(model, prompt: str, max_new_tokens: int = 128) -> torch.Tensor:
-    """Greedy-decode ``prompt``; return the 1-D token sequence (BOS + prompt + completion).
+def generate(model, prompt: str, max_new_tokens: int = 128) -> tuple[torch.Tensor, bool]:
+    """Greedy-decode ``prompt`` (already chat-formatted for ``-it``); return (BOS + prompt + completion, complete).
 
-    Generation is truncated after the first blank line (``\\n\\n``), which ends the worked answer.
+    Base: truncated after the first blank line (``\\n\\n``), which ends the worked answer. Chat: truncated
+    before <end_of_turn> / <eos> (not included). ``complete`` is False if ``max_new_tokens`` ran out first.
     """
     tokens = model.ensure_tokenized(prompt)  # prepends BOS
-    out = model.generate(
-        tokens[None], max_new_tokens=max_new_tokens, do_sample=False,
-        return_type="tokens", verbose=False,
+    chat = is_chat(model)
+    eot = model.tokenizer.convert_tokens_to_ids("<end_of_turn>") if chat else None
+    stop_ids = {eot, model.tokenizer.eos_token_id} if chat else set()
+    out = model.generate(  # chat: stop at <end_of_turn> (TransformerLens takes one stop id)
+        tokens[None], max_new_tokens=max_new_tokens, do_sample=False, return_type="tokens", verbose=False,
+        **({"eos_token_id": eot} if chat else {}),
     )[0].cpu()
     text = ""
     for i in range(len(tokens), len(out)):
+        if int(out[i]) in stop_ids:
+            return out[:i], True
         text += model.tokenizer.decode(out[i])
-        if "\n\n" in text:
-            return out[: i + 1]
-    return out
+        if not chat and "\n\n" in text:
+            return out[: i + 1], True
+    return out, False
 
 
 def step_final_positions(tokens: torch.Tensor, tokenizer, n_prompt: int, prefix: str = "=") -> list[Step]:
@@ -67,7 +83,8 @@ def step_final_positions(tokens: torch.Tensor, tokenizer, n_prompt: int, prefix:
 
     Text is split into lines by decoding token-by-token (index 0 is BOS and skipped). A step's
     final token is the last digit-containing token on its line; ``prev_line`` is the previous
-    non-empty line (prompt lines included), so the first step sees the problem statement.
+    non-empty line (prompt lines included, chat markers like ``<start_of_turn>model`` skipped), so the first
+    step sees the problem statement.
     """
     lines, cur, last = [], "", None
     for i in range(1, len(tokens)):
@@ -84,7 +101,7 @@ def step_final_positions(tokens: torch.Tensor, tokenizer, n_prompt: int, prefix:
     for text, pos in lines:
         if text.startswith(prefix) and pos is not None and pos >= n_prompt:
             steps.append(Step(pos, text, prev))
-        if text:
+        if text and not text.startswith("<"):
             prev = text
     return steps
 
@@ -127,21 +144,25 @@ def token_class_table(tokenizer) -> torch.Tensor:
 def run_problems(model, prompts: dict[str, str], out_dir: str | Path, max_new_tokens: int = 128) -> list[dict]:
     """Generate on each prompt and save one record per problem to ``out_dir/{problem_id}.pt``.
 
-    Record: ``{problem_id, prompt, tokens, n_prompt, steps: [{pos, line, prev_line, error_norms}]}`` where
-    ``error_norms`` is (n_layers, pos), matching the graph input ``tokens[:pos]``.
+    Record: ``{problem_id, prompt, tokens, n_prompt, complete, steps: [{pos, line, prev_line, error_norms}]}``
+    where ``error_norms`` is (n_layers, pos), matching the graph input ``tokens[:pos]``. For a chat model the
+    prompt is wrapped in ``CHAT_TEMPLATE`` first and ``prompt`` stores the wrapped text.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     records = []
     for pid, prompt in prompts.items():
-        tokens = generate(model, prompt, max_new_tokens)
+        if is_chat(model):
+            prompt = CHAT_TEMPLATE.format(prompt)
+        tokens, complete = generate(model, prompt, max_new_tokens)
         n_prompt = len(model.ensure_tokenized(prompt))
         norms = error_norms(model, tokens)
         steps = [
             {"pos": s.pos, "line": s.line, "prev_line": s.prev_line, "error_norms": norms[:, : s.pos].clone()}
             for s in step_final_positions(tokens, model.tokenizer, n_prompt)
         ]
-        rec = {"problem_id": pid, "prompt": prompt, "tokens": tokens, "n_prompt": n_prompt, "steps": steps}
+        rec = {"problem_id": pid, "prompt": prompt, "tokens": tokens, "n_prompt": n_prompt, "complete": complete,
+               "steps": steps}
         torch.save(rec, out_dir / f"{pid}.pt")
         records.append(rec)
     return records

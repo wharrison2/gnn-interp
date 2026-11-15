@@ -208,10 +208,11 @@ def nbytes(obj) -> int:
 # --------------------------------------------------------------------------------------------
 
 def label_record(record: dict, problem: Problem, tokenizer) -> list[StepGrade]:
-    """Grade a ``gemma.run_problems`` record; the last step is unusable if generation never hit a blank line."""
+    """Grade a ``gemma.run_problems`` record; the last step is unusable if generation was cut off
+    (``record["complete"]``; older records without it: no blank line in the completion)."""
     completion = tokenizer.decode(record["tokens"][record["n_prompt"]:])
     lines = [s["line"] for s in record["steps"]]
-    return grade_steps(problem.expression, lines, complete="\n\n" in completion)
+    return grade_steps(problem.expression, lines, complete=record.get("complete", "\n\n" in completion))
 
 
 def _done(manifest: Path) -> set[tuple[str, int]]:

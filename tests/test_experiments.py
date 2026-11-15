@@ -132,7 +132,7 @@ def test_precision_check(tmp_path, monkeypatch):
         return graphs[key]
 
     monkeypatch.setattr(gemma, "load_model", lambda device, dtype: SimpleNamespace(dtype=dtype))
-    monkeypatch.setattr(gemma, "generate", lambda m, prompt, n: torch.arange(5))
+    monkeypatch.setattr(gemma, "generate", lambda m, prompt, n: (torch.arange(5), True))
     monkeypatch.setattr(gemma, "error_norms", lambda m, tokens: torch.arange(12.0).reshape(3, 4)
                         + (0 if m.dtype is experiments.DTYPES["float32"] else torch.rand(3, 4)))
     monkeypatch.setattr(attribution, "build_graph", fake_build_graph)

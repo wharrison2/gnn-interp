@@ -13,7 +13,7 @@ python3 -m venv --system-site-packages .venv
 import os
 from huggingface_hub import login, snapshot_download
 login(token=os.environ["HF_TOKEN"])
-for repo in ["google/gemma-2-2b", "mntss/gemma-scope-transcoders"]:
+for repo in ["google/gemma-2-2b", "google/gemma-2-2b-it", "mntss/gemma-scope-transcoders"]:
     print(snapshot_download(repo))
 PY
 .venv/bin/python -m pytest -q -m "not slow"
