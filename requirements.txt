@@ -5,4 +5,4 @@ networkx
 numpy
 transformers
 pytest
-circuit-tracer @ git+https://github.com/safety-research/circuit-tracer.git
+circuit-tracer @ git+https://github.com/safety-research/circuit-tracer.git@255d989e93be1299d53d67b59e9fd76a0e274b14  # tested (0.5.3); bump deliberately
