@@ -568,7 +568,7 @@ def main(argv=None):
     ap.add_argument("--dtype", default="float32", choices=list(DTYPES))
     ap.add_argument("--model", default="base", choices=list(gemma.MODELS), help="balance/batch/sizes: base or instruct")
     ap.add_argument("--caps", type=int, nargs="+", default=[8192, 4096, 2048], help="sizes: max_feature_nodes")
-    ap.add_argument("--batch-size", type=int, default=256, help="attribution batch size (lower if OOM)")
+    ap.add_argument("--batch-size", type=int, default=64, help="attribution batch size (256 OOMs on an L4 in bf16)")
     ap.add_argument("--batch-sizes", type=int, nargs="+", default=[64, 256, 512, 1024], help="batch: sizes to time")
     ap.add_argument("--conv", default="graphconv")
     a = ap.parse_args(argv)
