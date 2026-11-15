@@ -3,12 +3,15 @@
 Run from the repo root, e.g. on a GPU VM or Colab::
 
     python -m gnn_interp.experiments memory  --out runs/memory                       # 1. memory fit
-    python -m gnn_interp.experiments balance --out runs/balance --n 70               # 3. class balance
+    python -m gnn_interp.experiments balance --out runs/balance --n 70               # 3. class balance + residuals
+    python -m gnn_interp.experiments batch   --out runs/batch --steps runs/balance --n 5   # attribution batch size
+    python -m gnn_interp.experiments precision --out runs/precision --steps runs/balance --n 10  # fp32 vs bf16
     python -m gnn_interp.experiments sizes   --out runs/sizes --steps runs/balance --n 100  # 2. timing + size
     python -m gnn_interp.experiments gnn     --out runs/gnn --data runs/sizes/data.pt      # 4. GNN epoch time
     python -m gnn_interp.experiments cv      --out runs/cv --data runs/sizes/data.pt       # 5. CV dry run
+    python -m gnn_interp.experiments probe   --out runs/probe --steps runs/balance         # residual probe (CPU)
 
-``balance`` runs before ``sizes`` because it generates and labels the steps that ``sizes`` attributes.
+``balance`` runs first: it generates and labels the steps that ``batch``, ``precision``, ``sizes`` and ``probe`` use.
 Problems, grading and graph building are Ananth's (``problems``, ``attribution``); this module only measures.
 Each command writes a ``summary.json``; ``balance`` and ``sizes`` also write per-row ``.jsonl`` files and
 skip rows already written, so a preempted spot VM can rerun the same command.
@@ -36,7 +39,8 @@ DEFAULT_THRESHOLD = (0.8, 0.98)
 # difficulty levels: kwargs for ``problems.generate_problems`` (tune after the first ``balance`` run)
 LEVELS = {"easy": dict(n_ops=2, operand_range=(1, 20), max_abs=999),
           "medium": dict(n_ops=3, operand_range=(1, 50), max_abs=9999),
-          "hard": dict(n_ops=4, operand_range=(1, 99), max_abs=99999)}
+          "hard": dict(n_ops=4, operand_range=(1, 99), max_abs=99999),
+          "xhard": dict(n_ops=5, operand_range=(10, 999), max_abs=999999)}
 
 
 # --------------------------------------------------------------------------------------------
@@ -78,6 +82,10 @@ def _append_jsonl(path: Path, row: dict):
 def _write_json(path: Path, obj):
     path.write_text(json.dumps(obj, indent=2, default=float))
     print(json.dumps(obj, indent=2, default=float))
+
+
+def _mean(values) -> float:
+    return float(np.mean(values)) if len(values) else float("nan")
 
 
 def _quantiles(values) -> dict[str, float]:
@@ -127,25 +135,33 @@ def memory_fit(configs=(("float32", False), ("bfloat16", False), ("bfloat16", Tr
 # --------------------------------------------------------------------------------------------
 
 def class_balance(model, out_dir: Path, n_per_level: int, levels=tuple(LEVELS),
-                  seed: int = 0, max_new_tokens: int = 128) -> dict:
+                  seed: int = 0, max_new_tokens: int = 192, save_resid: bool = True) -> dict:
     """Generate ``n_per_level`` problems per level, grade every step, and summarise error rates.
 
     Writes ``records/{problem_id}.pt`` (``gemma.run_problems``) and ``steps.jsonl`` (one row per step:
-    the ``problems.StepGrade`` fields plus level and ``pos``; a problem without steps gets one row with
-    ``step_idx=None``).
+    the ``problems.StepGrade`` fields plus level, ``pos``, the problem's ``seconds`` (generation + error
+    norms) and ``n_generated`` tokens; a problem without steps gets one row with ``step_idx=None``).
+    With ``save_resid``, ``resid/{problem_id}.pt`` holds ``gemma.residual_stream`` at each step's ``pos - 1``
+    (n_steps, n_layers + 1, d) for the residual-stream probe baseline (``probe_baseline``).
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    rec_dir, steps_path = out_dir / "records", out_dir / "steps.jsonl"
+    rec_dir, steps_path, resid_dir = out_dir / "records", out_dir / "steps.jsonl", out_dir / "resid"
+    resid_dir.mkdir(exist_ok=True)
     done = {r["problem_id"] for r in _read_jsonl(steps_path)}
     for level in levels:
         for p in problems.generate_problems(n_per_level, seed=seed, **LEVELS[level]):
             if p.problem_id in done:
                 continue
+            t = time.perf_counter()
             rec = gemma.run_problems(model, {p.problem_id: p.prompt}, rec_dir, max_new_tokens)[0]
+            timing = {"seconds": time.perf_counter() - t, "n_generated": len(rec["tokens"]) - rec["n_prompt"]}
+            if save_resid and rec["steps"]:
+                torch.save(gemma.residual_stream(model, rec["tokens"], [s["pos"] - 1 for s in rec["steps"]]),
+                           resid_dir / f"{p.problem_id}.pt")
             grades = attribution.label_record(rec, p, model.tokenizer)
             rows = [{**asdict(g), "pos": s["pos"]} for g, s in zip(grades, rec["steps"])] or [{"step_idx": None}]
             for r in rows:
-                _append_jsonl(steps_path, {"problem_id": p.problem_id, "level": level, **r})
+                _append_jsonl(steps_path, {"problem_id": p.problem_id, "level": level, **r, **timing})
     return summarize_balance(_read_jsonl(steps_path))
 
 
@@ -164,6 +180,7 @@ def summarize_balance(rows: list[dict]) -> dict:
         pids = {r["problem_id"] for r in lv}
         last = {r["problem_id"]: r for r in steps}  # rows are in step order
         n_bad = sum(r["label"] for r in labelled)
+        per_problem = {r["problem_id"]: r for r in lv if "seconds" in r}.values()
         out[level] = {
             "problems": len(pids),
             "problems_without_steps": len(pids - set(last)),
@@ -176,6 +193,8 @@ def summarize_balance(rows: list[dict]) -> dict:
             "final_answer_acc": float(np.mean([r["global_ok"] for r in last.values()])) if last else float("nan"),
             "mean_pos": float(np.mean([r["pos"] for r in steps])) if steps else float("nan"),
             "labelled_steps_per_250_incorrect": 250 * len(labelled) / max(n_bad, 1),
+            "seconds_per_problem": _mean([r["seconds"] for r in per_problem]),
+            "generated_tokens_per_problem": _mean([r["n_generated"] for r in per_problem]),
         }
     return out
 
@@ -188,12 +207,13 @@ def graph_stats(graph, thresholds=THRESHOLDS) -> dict:
     """Unpruned size, and kept nodes (by type) / edges after ``prune_graph`` at each threshold.
 
     ``edges_node_pruned``: all edges among the kept nodes; ``edges``: edges after the edge prune too.
-    ``*_mb`` assume sparse COO (int64 x2 + fp32 = 20 B/edge).
+    ``*_mb`` assume sparse COO (int64 x2 + fp32 = 20 B/edge). ``replacement_score`` / ``completeness_score``:
+    circuit-tracer's ``compute_graph_scores`` (share of influence through features rather than error nodes).
     ``sparse``: ``attribution.save_compact`` file (default range): stored nodes, all edges among them,
     stored edges, serialized MB; and node / edge Jaccard of ``attribution.prune`` (full-graph edge
     scoring) vs circuit-tracer's ``prune_graph`` at ``DEFAULT_THRESHOLD``.
     """
-    from circuit_tracer.graph import prune_graph
+    from circuit_tracer.graph import compute_graph_scores, prune_graph
 
     adj = graph.adjacency_matrix.cpu()
     nz = adj != 0
@@ -201,6 +221,7 @@ def graph_stats(graph, thresholds=THRESHOLDS) -> dict:
     n_err = graph.cfg.n_layers * graph.n_pos
     out = {"n_pos": graph.n_pos, "n_active": len(graph.active_features), "n_feat": n_feat, "n_nodes": adj.shape[0],
            "nnz": int(nz.sum()), "dense_mb": adj.numel() * adj.element_size() / 1e6, "pruned": {}}
+    out["replacement_score"], out["completeness_score"] = compute_graph_scores(graph)
     bounds = np.cumsum([0, n_feat, n_err, n_tok, n_logit])
     for nt, et in thresholds:
         node_mask, edge_mask = (m.cpu() for m in prune_graph(graph, nt, et)[:2])
@@ -225,6 +246,10 @@ def graph_stats(graph, thresholds=THRESHOLDS) -> dict:
 
 def _jaccard(a: torch.Tensor, b: torch.Tensor) -> float:
     return int((a & b).sum()) / max(int((a | b).sum()), 1)
+
+
+def _set_jaccard(a: set, b: set) -> float:
+    return len(a & b) / len(a | b) if a | b else 1.0
 
 
 def _kept_feature_keys(graph, threshold=DEFAULT_THRESHOLD) -> set:
@@ -287,7 +312,7 @@ def graph_sizes(model, steps_dir: Path, out_dir: Path, n: int, max_feature_nodes
                     torch.save(data, data_path)
             else:
                 kept = _kept_feature_keys(graph)
-                stats["jaccard_vs_ref"] = len(kept & ref) / max(len(kept | ref), 1)
+                stats["jaccard_vs_ref"] = _set_jaccard(kept, ref)
             row["by_cap"][str(cap)] = stats
             del graph
             _free()
@@ -303,12 +328,141 @@ def summarize_sizes(rows: list[dict]) -> dict:
     for cap in rows[0]["by_cap"]:
         s = [r["by_cap"][cap] for r in rows]
         out[cap] = {k: _quantiles([x[k] for x in s])
-                    for k in ("seconds", "peak_gb", "n_pos", "n_active", "n_feat", "n_nodes", "nnz", "dense_mb")}
+                    for k in ("seconds", "peak_gb", "n_pos", "n_active", "n_feat", "n_nodes", "nnz", "dense_mb",
+                              "replacement_score", "completeness_score")}
         if "jaccard_vs_ref" in s[0]:
             out[cap]["jaccard_vs_ref"] = _quantiles([x["jaccard_vs_ref"] for x in s])
         out[cap]["sparse"] = {k: _quantiles([x["sparse"][k] for x in s]) for k in s[0]["sparse"]}
         out[cap]["pruned"] = {th: {k: _quantiles([x["pruned"][th][k] for x in s]) for k in s[0]["pruned"][th]}
                               for th in s[0]["pruned"]}
+    return out
+
+
+# --------------------------------------------------------------------------------------------
+# 2b. Attribution batch size and precision (on steps from ``class_balance``)
+# --------------------------------------------------------------------------------------------
+
+def _load_steps(steps_dir: Path, n: int, seed: int = 0) -> list[tuple[dict, dict]]:
+    """``sample_steps`` from a ``class_balance`` directory, each with its problem record."""
+    return [(st, torch.load(steps_dir / "records" / f"{st['problem_id']}.pt", weights_only=False))
+            for st in sample_steps(_read_jsonl(steps_dir / "steps.jsonl"), n, seed)]
+
+
+def batch_sweep(model, steps_dir: Path, n: int = 5, batch_sizes=(64, 256, 512, 1024),
+                max_feature_nodes: int = 4096) -> dict:
+    """Seconds and peak memory per graph for each attribution ``batch_size`` (one warm-up graph first)."""
+    steps = _load_steps(steps_dir, n)
+    st, rec = steps[0]
+    attribution.build_graph(model, rec["tokens"], st["pos"], max_feature_nodes=max_feature_nodes)  # warm-up
+    _free()
+    out = {}
+    for bs in batch_sizes:
+        secs, peaks, oom = [], [], 0
+        for st, rec in steps:
+            try:
+                _reset_peak()
+                t = time.perf_counter()
+                attribution.build_graph(model, rec["tokens"], st["pos"], max_feature_nodes=max_feature_nodes,
+                                        batch_size=bs)
+                secs.append(time.perf_counter() - t)
+                peaks.append(_peak_gb())
+            except torch.OutOfMemoryError:
+                oom += 1
+            _free()
+        out[str(bs)] = {"seconds": _mean(secs), "peak_gb": max(peaks, default=float("nan")), "oom": oom}
+        print(bs, out[str(bs)])
+    return out
+
+
+def _pearson(a: torch.Tensor, b: torch.Tensor) -> float:
+    return float(np.corrcoef(a.flatten().numpy(), b.flatten().numpy())[0, 1])
+
+
+def precision_check(steps_dir: Path, n: int = 10, dtypes=("float32", "bfloat16"), batch_size: int = 256,
+                    max_feature_nodes: int = 4096, max_new_tokens: int = 192) -> dict:
+    """Does lower precision change the data? Each dtype loads the model once and, per sampled step, records
+    greedy generation, error norms, top-1 logit, kept features (default pruning) and attribution time.
+
+    Compared with ``dtypes[0]``: same generation, error-norm Pearson r, same top-1 logit, kept-feature Jaccard.
+    """
+    steps = _load_steps(steps_dir, n)
+    res = {}
+    for dtype in dtypes:
+        model = gemma.load_model("cuda" if _cuda() else None, DTYPES[dtype])
+        rows = []
+        for st, rec in steps:
+            gen = gemma.generate(model, rec["prompt"], max_new_tokens)
+            _reset_peak()
+            t = time.perf_counter()
+            graph = attribution.build_graph(model, rec["tokens"], st["pos"], max_feature_nodes=max_feature_nodes,
+                                            batch_size=batch_size)
+            rows.append({"seconds": time.perf_counter() - t, "peak_gb": _peak_gb(), "gen": gen,
+                         "norms": gemma.error_norms(model, rec["tokens"][: st["pos"]]),
+                         "top1": int(graph.logit_token_ids[0]), "kept": _kept_feature_keys(graph)})
+            del graph
+            _free()
+        res[dtype] = rows
+        del model
+        _free()
+    ref = res[dtypes[0]]
+    out = {}
+    for dtype, rows in res.items():
+        out[dtype] = {"seconds": _mean([r["seconds"] for r in rows]),
+                      "peak_gb": max(r["peak_gb"] for r in rows)}
+        if dtype != dtypes[0]:
+            out[dtype] |= {
+                "same_generation": _mean([torch.equal(a["gen"], b["gen"]) for a, b in zip(ref, rows)]),
+                "error_norm_r": _quantiles([_pearson(a["norms"], b["norms"]) for a, b in zip(ref, rows)]),
+                "same_top1": _mean([a["top1"] == b["top1"] for a, b in zip(ref, rows)]),
+                "feature_jaccard": _quantiles([_set_jaccard(a["kept"], b["kept"]) for a, b in zip(ref, rows)])}
+    return out
+
+
+# --------------------------------------------------------------------------------------------
+# 3b. Residual-stream probe (CPU; on the residuals saved by ``class_balance``)
+# --------------------------------------------------------------------------------------------
+
+def load_resid(steps_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Labelled steps' residuals (n, n_layers + 1, d) as float32, labels and problem IDs."""
+    xs, y, groups, cache = [], [], [], {}
+    for r in _read_jsonl(steps_dir / "steps.jsonl"):
+        path = steps_dir / "resid" / f"{r['problem_id']}.pt"
+        if r.get("label") is None or not path.exists():
+            continue
+        if r["problem_id"] not in cache:
+            cache[r["problem_id"]] = torch.load(path).float().numpy()
+        xs.append(cache[r["problem_id"]][r["step_idx"]])
+        y.append(r["label"]), groups.append(r["problem_id"])
+    return np.stack(xs), np.asarray(y), np.asarray(groups)
+
+
+def probe_baseline(steps_dir: Path, layers=None, n_folds: int = 5, seeds=range(3), C: float = 0.01) -> dict:
+    """Per layer: problem-grouped CV of a standardised L2 logistic regression on the residual stream.
+
+    An early check that errors are detectable at all; if this matches the GNN, the graph adds nothing.
+    Few incorrect steps make it noisy: read it with ``n_incorrect``.
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    from .train import grouped_cv, summarize
+
+    X, y, groups = load_resid(steps_dir)
+    out = {"n_steps": len(y), "n_incorrect": int(y.sum())}
+    if y.sum() < n_folds or (1 - y).sum() < n_folds:
+        return out | {"skipped": f"fewer than {n_folds} steps in a class"}
+    for layer in (range(X.shape[1]) if layers is None else layers):
+        Xl = X[:, layer]
+
+        def fit_predict(tr, te, seed, Xl=Xl):
+            clf = make_pipeline(StandardScaler(), LogisticRegression(C=C, class_weight="balanced", max_iter=2000))
+            return clf.fit(Xl[tr], y[tr]).predict_proba(Xl[te])[:, 1]
+
+        rows, _ = grouped_cv(y, groups, fit_predict, n_folds, seeds)
+        m = summarize(rows)
+        out[f"layer_{layer}"] = {k: m[k] for k in ("auroc", "aupr")}
+        print(layer, out[f"layer_{layer}"])
     return out
 
 
@@ -377,25 +531,34 @@ def cv_dry_run(data_list, conv: str = "graphconv", n_folds: int = 5, seeds=range
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("experiment", choices=["memory", "balance", "sizes", "gnn", "cv"])
+    ap.add_argument("experiment", choices=["memory", "balance", "batch", "precision", "sizes", "gnn", "cv", "probe"])
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--n", type=int, default=100, help="balance: problems per level; sizes: steps to attribute")
     ap.add_argument("--levels", nargs="+", default=list(LEVELS))
-    ap.add_argument("--steps", type=Path, help="sizes: the balance output directory")
+    ap.add_argument("--steps", type=Path, help="batch/precision/sizes/probe: the balance output directory")
     ap.add_argument("--data", type=Path, help="gnn/cv: data.pt written by sizes")
     ap.add_argument("--dtype", default="float32", choices=list(DTYPES))
     ap.add_argument("--caps", type=int, nargs="+", default=[8192, 4096, 2048], help="sizes: max_feature_nodes")
     ap.add_argument("--batch-size", type=int, default=256, help="attribution batch size (lower if OOM)")
+    ap.add_argument("--batch-sizes", type=int, nargs="+", default=[64, 256, 512, 1024], help="batch: sizes to time")
     ap.add_argument("--conv", default="graphconv")
     a = ap.parse_args(argv)
     a.out.mkdir(parents=True, exist_ok=True)
 
     if a.experiment == "memory":
         result = memory_fit(batch_size=a.batch_size)
-    elif a.experiment in ("balance", "sizes"):
+    elif a.experiment == "precision":
+        result = precision_check(a.steps, a.n, batch_size=a.batch_size)
+    elif a.experiment == "probe":
+        result = probe_baseline(a.steps)
+    elif a.experiment in ("balance", "batch", "sizes"):
         model = gemma.load_model("cuda" if _cuda() else None, DTYPES[a.dtype])
-        result = (class_balance(model, a.out, a.n, a.levels) if a.experiment == "balance" else
-                  graph_sizes(model, a.steps, a.out, a.n, a.caps, a.batch_size))
+        if a.experiment == "balance":
+            result = class_balance(model, a.out, a.n, a.levels)
+        elif a.experiment == "batch":
+            result = batch_sweep(model, a.steps, a.n, a.batch_sizes)
+        else:
+            result = graph_sizes(model, a.steps, a.out, a.n, a.caps, a.batch_size)
     else:
         data = torch.load(a.data, weights_only=False)
         result = gnn_epoch_timing(data) if a.experiment == "gnn" else cv_dry_run(data, a.conv)

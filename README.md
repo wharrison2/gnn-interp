@@ -12,8 +12,8 @@ Predict whether an arithmetic step written by Gemma 2 2B is correct, from its at
 - `metrics`: classification metrics (positive class = incorrect step).
 - `problems`: arithmetic problem generation, few-shot prompts, step grading (labels).
 - `attribution`: build + prune attribution graphs per labelled step, write the dataset manifest.
-- `experiments`: calibration runs that size the real run (memory, class balance, attribution time and graph
-  size, GNN epoch time, CV dry run); `python -m gnn_interp.experiments --help`.
+- `experiments`: calibration runs that size the real run (memory, class balance + residual stream, attribution
+  batch size, fp32 vs bf16, attribution time and graph size/quality, GNN epoch time, CV dry run, residual probe); `python -m gnn_interp.experiments --help`.
 
 ## Install
 ```
@@ -40,5 +40,5 @@ Then run from the repo root (`from gnn_interp import ...`).
 
 ## GPU VM (Google Cloud)
 `scripts/`: `create_vm.sh` (local; 1x L4 VM, needs `PROJECT`), `setup_vm.sh` (on the VM from the repo root; needs
-`HF_TOKEN` in the environment or `.env`, which is gitignored), `run_experiments.sh` (calibration experiments 1-5;
+`HF_TOKEN` in the environment or `.env`, which is gitignored), `run_experiments.sh` (all calibration experiments;
 optional `BUCKET` to sync `runs/`). Usage is in each script's header. Stop the VM when done.

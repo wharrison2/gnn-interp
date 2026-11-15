@@ -99,6 +99,19 @@ def error_norms(model, tokens: torch.Tensor) -> torch.Tensor:
     return ctx.error_vectors.norm(dim=-1).float().cpu()
 
 
+@torch.no_grad()
+def residual_stream(model, tokens: torch.Tensor, positions: list[int]) -> torch.Tensor:
+    """Residual stream at ``positions``: embeddings + every layer's output, (len(positions), n_layers + 1, d), fp16.
+
+    For a step whose final token is at ``p``, use position ``p - 1``: the last input of its graph (``tokens[:p]``),
+    whose output predicts ``tokens[p]``.
+    """
+    names = ["blocks.0.hook_resid_pre"] + [f"blocks.{i}.hook_resid_post" for i in range(model.cfg.n_layers)]
+    _, cache = model.run_with_cache(tokens[None].to(model.cfg.device), names_filter=lambda n: n in names)
+    idx = torch.as_tensor(positions, dtype=torch.long)
+    return torch.stack([cache[n][0, idx.to(cache[n].device)] for n in names], 1).half().cpu()
+
+
 def token_class_table(tokenizer) -> torch.Tensor:
     """Map every vocab id to a coarse class: DIGIT, OPERATOR (``+-*/=()``) or OTHER."""
     table = torch.full((len(tokenizer),), OTHER, dtype=torch.long)
