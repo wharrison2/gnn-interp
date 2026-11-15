@@ -141,6 +141,7 @@ def class_balance(model, out_dir: Path, n_per_level: int, levels=tuple(LEVELS),
     Writes ``records/{problem_id}.pt`` (``gemma.run_problems``) and ``steps.jsonl`` (one row per step:
     the ``problems.StepGrade`` fields plus level, ``pos``, the problem's ``seconds`` (generation + error
     norms) and ``n_generated`` tokens; a problem without steps gets one row with ``step_idx=None``).
+    ``generations.jsonl``: per problem, the expression, answer, generated text and whether it finished.
     With ``save_resid``, ``resid/{problem_id}.pt`` holds ``gemma.residual_stream`` at each step's ``pos - 1``
     (n_steps, n_layers + 1, d) for the residual-stream probe baseline (``probe_baseline``).
     """
@@ -158,6 +159,10 @@ def class_balance(model, out_dir: Path, n_per_level: int, levels=tuple(LEVELS),
             if save_resid and rec["steps"]:
                 torch.save(gemma.residual_stream(model, rec["tokens"], [s["pos"] - 1 for s in rec["steps"]]),
                            resid_dir / f"{p.problem_id}.pt")
+            _append_jsonl(out_dir / "generations.jsonl", {
+                "problem_id": p.problem_id, "level": level, "expression": p.expression, "answer": p.value,
+                "completion": model.tokenizer.decode(rec["tokens"][rec["n_prompt"]:]),
+                "complete": rec.get("complete")})
             grades = attribution.label_record(rec, p, model.tokenizer)
             rows = [{**asdict(g), "pos": s["pos"]} for g, s in zip(grades, rec["steps"])] or [{"step_idx": None}]
             for r in rows:
@@ -384,6 +389,7 @@ def precision_check(steps_dir: Path, n: int = 10, dtypes=("float32", "bfloat16")
     greedy generation, error norms, top-1 logit, kept features (default pruning) and attribution time.
 
     Compared with ``dtypes[0]``: same generation, error-norm Pearson r, same top-1 logit, kept-feature Jaccard.
+    ``generations``: each step's problem and the text each dtype generated for it.
     """
     steps = _load_steps(steps_dir, n)
     res = {}
@@ -397,6 +403,7 @@ def precision_check(steps_dir: Path, n: int = 10, dtypes=("float32", "bfloat16")
             graph = attribution.build_graph(model, rec["tokens"], st["pos"], max_feature_nodes=max_feature_nodes,
                                             batch_size=batch_size)
             rows.append({"seconds": time.perf_counter() - t, "peak_gb": _peak_gb(), "gen": gen,
+                         "text": model.tokenizer.decode(gen[len(model.ensure_tokenized(rec["prompt"])):]),
                          "norms": gemma.error_norms(model, rec["tokens"][: st["pos"]]),
                          "top1": int(graph.logit_token_ids[0]), "kept": _kept_feature_keys(graph)})
             del graph
@@ -405,7 +412,8 @@ def precision_check(steps_dir: Path, n: int = 10, dtypes=("float32", "bfloat16")
         del model
         _free()
     ref = res[dtypes[0]]
-    out = {}
+    out = {"generations": [{"problem_id": st["problem_id"], **{d: res[d][i]["text"] for d in dtypes}}
+                           for i, (st, _) in enumerate(steps)]}
     for dtype, rows in res.items():
         out[dtype] = {"seconds": _mean([r["seconds"] for r in rows]),
                       "peak_gb": max(r["peak_gb"] for r in rows)}

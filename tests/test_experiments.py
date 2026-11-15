@@ -92,6 +92,8 @@ def test_balance_and_sizes_plumbing(tmp_path, monkeypatch):
     assert bal["easy"]["labelled_steps"] == 6 and bal["easy"]["incorrect_steps"] == 3
     assert bal["easy"]["seconds_per_problem"] >= 0 and bal["easy"]["generated_tokens_per_problem"] == N_POS
     assert len(list((tmp_path / "bal" / "resid").glob("*.pt"))) == 3
+    gens = experiments._read_jsonl(tmp_path / "bal" / "generations.jsonl")
+    assert len(gens) == 3 and gens[0]["completion"] and gens[0]["answer"] == 6
     X, y, groups = experiments.load_resid(tmp_path / "bal")
     assert X.shape == (6, N_LAYERS + 1, 4) and y.sum() == 3 and len(set(groups)) == 3
     bs = experiments.batch_sweep(model, tmp_path / "bal", 2, batch_sizes=(8, 16), max_feature_nodes=12)
@@ -131,7 +133,8 @@ def test_precision_check(tmp_path, monkeypatch):
             graphs[key] = g
         return graphs[key]
 
-    monkeypatch.setattr(gemma, "load_model", lambda device, dtype: SimpleNamespace(dtype=dtype))
+    monkeypatch.setattr(gemma, "load_model", lambda device, dtype: SimpleNamespace(
+        dtype=dtype, ensure_tokenized=lambda p: torch.arange(2), tokenizer=SimpleNamespace(decode=lambda ids: "= 1")))
     monkeypatch.setattr(gemma, "generate", lambda m, prompt, n: (torch.arange(5), True))
     monkeypatch.setattr(gemma, "error_norms", lambda m, tokens: torch.arange(12.0).reshape(3, 4)
                         + (0 if m.dtype is experiments.DTYPES["float32"] else torch.rand(3, 4)))
@@ -141,6 +144,7 @@ def test_precision_check(tmp_path, monkeypatch):
     assert bf["same_generation"] == 1 and bf["same_top1"] == 1 and bf["feature_jaccard"]["mean"] == 1
     assert len(experiments._kept_feature_keys(graphs[0])) > 0  # the Jaccard compares non-empty sets
     assert 0.5 < bf["error_norm_r"]["mean"] < 1
+    assert len(out["generations"]) == 4 and out["generations"][0]["bfloat16"] == "= 1"
 
 
 def test_probe_baseline_finds_signal(tmp_path):
