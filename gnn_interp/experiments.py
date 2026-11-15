@@ -70,6 +70,14 @@ def _free():
         torch.cuda.empty_cache()
 
 
+def _isolated(fn, *args):
+    """Run ``fn(*args)`` in a fresh (spawned) process, so a loaded model's host and GPU memory is fully released."""
+    import multiprocessing as mp
+
+    with mp.get_context("spawn").Pool(1) as pool:
+        return pool.apply(fn, args)
+
+
 def _read_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
@@ -101,33 +109,35 @@ def memory_fit(configs=(("float32", False), ("bfloat16", False), ("bfloat16", Tr
                max_feature_nodes: int = 4096, batch_size: int = 256) -> list[dict]:
     """Peak GPU memory to load the model and build one attribution graph, per (dtype, lazy_encoder).
 
-    The prompt is a medium problem with its reference solution, attributed at its final token. An
-    out-of-memory error is recorded instead of raised.
+    The prompt is a medium problem with its reference solution, attributed at its final token. Each config
+    runs in its own process (two loads in one process exhaust the VM's 32 GB of RAM). An out-of-memory error
+    is recorded instead of raised.
     """
-    p = problems.generate_problems(1, **LEVELS["medium"])[0]
-    text = p.prompt + "\n".join(problems.solve_steps(p.expression))
     rows = []
     for dtype, lazy in configs:
-        row = {"dtype": dtype, "lazy_encoder": lazy, "max_feature_nodes": max_feature_nodes}
-        model = None
-        try:
-            _reset_peak()
-            model = gemma.load_model("cuda" if _cuda() else None, DTYPES[dtype], lazy_encoder=lazy)
-            row["load_peak_gb"] = _peak_gb()
-            tokens = model.ensure_tokenized(text)
-            row["n_pos"] = len(tokens)
-            _reset_peak()
-            t = time.perf_counter()
-            attribution.build_graph(model, tokens, len(tokens), max_feature_nodes=max_feature_nodes,
-                                    batch_size=batch_size)
-            row["attr_peak_gb"], row["attr_seconds"] = _peak_gb(), time.perf_counter() - t
-        except torch.OutOfMemoryError as e:
-            row["oom"] = str(e).splitlines()[0]
-        del model
-        _free()
-        rows.append(row)
-        print(row)
+        rows.append(_isolated(_memory_one, dtype, lazy, max_feature_nodes, batch_size))
+        print(rows[-1])
     return rows
+
+
+def _memory_one(dtype: str, lazy: bool, max_feature_nodes: int, batch_size: int) -> dict:
+    p = problems.generate_problems(1, **LEVELS["medium"])[0]
+    text = p.prompt + "\n".join(problems.solve_steps(p.expression))
+    row = {"dtype": dtype, "lazy_encoder": lazy, "max_feature_nodes": max_feature_nodes, "batch_size": batch_size}
+    try:
+        _reset_peak()
+        model = gemma.load_model("cuda" if _cuda() else None, DTYPES[dtype], lazy_encoder=lazy)
+        row["load_peak_gb"] = _peak_gb()
+        tokens = model.ensure_tokenized(text)
+        row["n_pos"] = len(tokens)
+        _reset_peak()
+        t = time.perf_counter()
+        attribution.build_graph(model, tokens, len(tokens), max_feature_nodes=max_feature_nodes,
+                                batch_size=batch_size)
+        row["attr_peak_gb"], row["attr_seconds"] = _peak_gb(), time.perf_counter() - t
+    except torch.OutOfMemoryError as e:
+        row["oom"] = str(e).splitlines()[0]
+    return row
 
 
 # --------------------------------------------------------------------------------------------
@@ -383,47 +393,56 @@ def _pearson(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(np.corrcoef(a.flatten().numpy(), b.flatten().numpy())[0, 1])
 
 
-def precision_check(steps_dir: Path, n: int = 10, dtypes=("float32", "bfloat16"), batch_size: int = 256,
-                    max_feature_nodes: int = 4096, max_new_tokens: int = 192) -> dict:
-    """Does lower precision change the data? Each dtype loads the model once and, per sampled step, records
-    greedy generation, error norms, top-1 logit, kept features (default pruning) and attribution time.
+def precision_check(steps_dir: Path, n: int = 10, dtypes=("float32", "bfloat16"), batch_size: int = 64,
+                    max_feature_nodes: int = 4096, max_new_tokens: int = 192, isolate: bool = True) -> dict:
+    """Does lower precision change the data? Each dtype loads the model once (in its own process if ``isolate``)
+    and, per sampled step, records greedy generation, error norms, top-1 logit, kept features (default
+    pruning) and attribution time. An attribution OOM is counted and that step's graph comparisons skipped.
 
     Compared with ``dtypes[0]``: same generation, error-norm Pearson r, same top-1 logit, kept-feature Jaccard.
     ``generations``: each step's problem and the text each dtype generated for it.
     """
     steps = _load_steps(steps_dir, n)
-    res = {}
-    for dtype in dtypes:
-        model = gemma.load_model("cuda" if _cuda() else None, DTYPES[dtype])
-        rows = []
-        for st, rec in steps:
-            gen, _ = gemma.generate(model, rec["prompt"], max_new_tokens)
-            _reset_peak()
-            t = time.perf_counter()
-            graph = attribution.build_graph(model, rec["tokens"], st["pos"], max_feature_nodes=max_feature_nodes,
-                                            batch_size=batch_size)
-            rows.append({"seconds": time.perf_counter() - t, "peak_gb": _peak_gb(), "gen": gen,
-                         "text": model.tokenizer.decode(gen[len(model.ensure_tokenized(rec["prompt"])):]),
-                         "norms": gemma.error_norms(model, rec["tokens"][: st["pos"]]),
-                         "top1": int(graph.logit_token_ids[0]), "kept": _kept_feature_keys(graph)})
-            del graph
-            _free()
-        res[dtype] = rows
-        del model
-        _free()
+    run = (lambda *a: _isolated(_precision_one, *a)) if isolate else _precision_one
+    res = {d: run(d, steps, batch_size, max_feature_nodes, max_new_tokens) for d in dtypes}
     ref = res[dtypes[0]]
     out = {"generations": [{"problem_id": st["problem_id"], **{d: res[d][i]["text"] for d in dtypes}}
                            for i, (st, _) in enumerate(steps)]}
     for dtype, rows in res.items():
-        out[dtype] = {"seconds": _mean([r["seconds"] for r in rows]),
-                      "peak_gb": max(r["peak_gb"] for r in rows)}
+        ok = [r for r in rows if "top1" in r]
+        out[dtype] = {"seconds": _mean([r["seconds"] for r in ok]), "oom": len(rows) - len(ok),
+                      "peak_gb": max((r["peak_gb"] for r in ok), default=float("nan"))}
         if dtype != dtypes[0]:
+            both = [(a, b) for a, b in zip(ref, rows) if "top1" in a and "top1" in b]
             out[dtype] |= {
                 "same_generation": _mean([torch.equal(a["gen"], b["gen"]) for a, b in zip(ref, rows)]),
                 "error_norm_r": _quantiles([_pearson(a["norms"], b["norms"]) for a, b in zip(ref, rows)]),
-                "same_top1": _mean([a["top1"] == b["top1"] for a, b in zip(ref, rows)]),
-                "feature_jaccard": _quantiles([_set_jaccard(a["kept"], b["kept"]) for a, b in zip(ref, rows)])}
+                "n_graph_pairs": len(both),
+                "same_top1": _mean([a["top1"] == b["top1"] for a, b in both]),
+                "feature_jaccard": _quantiles([_set_jaccard(a["kept"], b["kept"]) for a, b in both] or [float("nan")])}
     return out
+
+
+def _precision_one(dtype: str, steps, batch_size: int, max_feature_nodes: int, max_new_tokens: int) -> list[dict]:
+    model = gemma.load_model("cuda" if _cuda() else None, DTYPES[dtype])
+    rows = []
+    for st, rec in steps:
+        gen, _ = gemma.generate(model, rec["prompt"], max_new_tokens)
+        row = {"gen": gen, "text": model.tokenizer.decode(gen[len(model.ensure_tokenized(rec["prompt"])):]),
+               "norms": gemma.error_norms(model, rec["tokens"][: st["pos"]])}
+        try:
+            _reset_peak()
+            t = time.perf_counter()
+            graph = attribution.build_graph(model, rec["tokens"], st["pos"], max_feature_nodes=max_feature_nodes,
+                                            batch_size=batch_size)
+            row |= {"seconds": time.perf_counter() - t, "peak_gb": _peak_gb(),
+                    "top1": int(graph.logit_token_ids[0]), "kept": _kept_feature_keys(graph)}
+            del graph
+        except torch.OutOfMemoryError:
+            pass
+        _free()
+        rows.append(row)
+    return rows
 
 
 # --------------------------------------------------------------------------------------------

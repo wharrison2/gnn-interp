@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Calibration experiments (gnn_interp.experiments) in order, from the repo root. Each step logs to
 # runs/<step>.log; if BUCKET is set, runs/ is synced to $BUCKET/runs/<hostname> after each step.
-# Rerunning resumes (balance/sizes skip finished rows). Run inside tmux. DTYPE (default float32) is the
-# model precision for balance/batch/sizes; switch to bfloat16 if `memory` shows float32 does not fit.
+# Rerunning resumes (balance/sizes skip finished rows). Run inside tmux. DTYPE (default bfloat16) is the
+# model precision for balance/batch/sizes.
 # Usage: BUCKET=gs://my-bucket bash scripts/run_experiments.sh [first_step]
 set -euo pipefail
-DTYPE=${DTYPE:-float32}
+DTYPE=${DTYPE:-bfloat16}  # float32 does not fit an L4 (24 GB): attribution OOMs
 # step name -> experiment + args; *_it steps repeat balance/sizes/probe on the instruct model (smaller sizes run)
 steps=(memory balance balance_it batch precision sizes sizes_it gnn cv probe probe_it)
 declare -A cmd=(

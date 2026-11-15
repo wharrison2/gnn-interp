@@ -139,7 +139,7 @@ def test_precision_check(tmp_path, monkeypatch):
     monkeypatch.setattr(gemma, "error_norms", lambda m, tokens: torch.arange(12.0).reshape(3, 4)
                         + (0 if m.dtype is experiments.DTYPES["float32"] else torch.rand(3, 4)))
     monkeypatch.setattr(attribution, "build_graph", fake_build_graph)
-    out = experiments.precision_check(steps, 4)
+    out = experiments.precision_check(steps, 4, isolate=False)
     bf = out["bfloat16"]
     assert bf["same_generation"] == 1 and bf["same_top1"] == 1 and bf["feature_jaccard"]["mean"] == 1
     assert len(experiments._kept_feature_keys(graphs[0])) > 0  # the Jaccard compares non-empty sets
