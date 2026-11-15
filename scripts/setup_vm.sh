@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# One-time GPU VM setup, run from the repo root: venv on the image's CUDA torch, deps, Gemma 2 2B + transcoder
+# download, fast tests. Needs HF_TOKEN (gated Gemma) in the environment or in ./.env or ~/.env.
+# Usage: git clone https://github.com/wharrison2/gnn-interp.git && cd gnn-interp && bash scripts/setup_vm.sh
+set -euo pipefail
+for f in .env ~/.env; do [[ -f $f ]] && { set -a; source "$f"; set +a; }; done
+: "${HF_TOKEN:?set HF_TOKEN (environment, ./.env or ~/.env)}"
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python3 -m venv --system-site-packages .venv
+.venv/bin/pip install -q -r requirements.txt
+.venv/bin/python -c "import torch; assert torch.cuda.is_available(); print('torch', torch.__version__, 'cuda ok')"
+.venv/bin/python - <<'PY'
+import os
+from huggingface_hub import login, snapshot_download
+login(token=os.environ["HF_TOKEN"])
+for repo in ["google/gemma-2-2b", "mntss/gemma-scope-transcoders"]:
+    print(snapshot_download(repo))
+PY
+.venv/bin/python -m pytest -q -m "not slow"
+echo "setup done"

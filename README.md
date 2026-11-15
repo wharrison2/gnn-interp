@@ -37,3 +37,8 @@ installed), `gpu` (CUDA device; skipped if unavailable). Tests need no network o
 !git clone https://github.com/wharrison2/gnn-interp && cd gnn-interp && pip install -r requirements.txt
 ```
 Then run from the repo root (`from gnn_interp import ...`).
+
+## GPU VM (Google Cloud)
+`scripts/`: `create_vm.sh` (local; 1x L4 VM, needs `PROJECT`), `setup_vm.sh` (on the VM from the repo root; needs
+`HF_TOKEN` in the environment or `.env`, which is gitignored), `run_experiments.sh` (calibration experiments 1-5;
+optional `BUCKET` to sync `runs/`). Usage is in each script's header. Stop the VM when done.
