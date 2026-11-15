@@ -6,7 +6,8 @@ set -euo pipefail
 for f in .env ~/.env; do [[ -f $f ]] && { set -a; source "$f"; set +a; }; done
 : "${HF_TOKEN:?set HF_TOKEN (environment, ./.env or ~/.env)}"
 nvidia-smi --query-gpu=name,memory.total --format=csv
-python3 -m venv --system-site-packages .venv
+python3 -c "import ensurepip" 2>/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv; }
+python3 -m venv --system-site-packages .venv  # reuse the image's CUDA torch
 .venv/bin/pip install -q -r requirements.txt
 .venv/bin/python -c "import torch; assert torch.cuda.is_available(); print('torch', torch.__version__, 'cuda ok')"
 .venv/bin/python - <<'PY'
