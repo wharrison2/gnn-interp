@@ -13,7 +13,7 @@ for z in $ZONES; do
   if gcloud compute instances create "$VM" --project="$PROJECT" --zone="$z" --machine-type="$MACHINE" \
       --image-family="$IMAGE_FAMILY" --image-project=deeplearning-platform-release \
       --boot-disk-size=200GB --boot-disk-type=pd-balanced --maintenance-policy=TERMINATE \
-      --scopes=storage-full --metadata=install-nvidia-driver=True "${prov[@]}"; then
+      --scopes=storage-full --metadata=install-nvidia-driver=True ${prov[@]+"${prov[@]}"}; then
     echo "created $VM in $z"; exit 0
   fi
 done
