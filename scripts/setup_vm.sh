@@ -6,6 +6,10 @@ set -euo pipefail
 for f in .env ~/.env; do [[ -f $f ]] && { set -a; source "$f"; set +a; }; done
 : "${HF_TOKEN:?set HF_TOKEN (environment, ./.env or ~/.env)}"
 nvidia-smi --query-gpu=name,memory.total --format=csv
+# Loading the model in bf16 briefly needs > 32 GB of host RAM (g2-standard-8): add swap for the spike.
+if ! swapon --show | grep -q /swapfile; then
+  sudo fallocate -l 48G /swapfile && sudo chmod 600 /swapfile && sudo mkswap -q /swapfile && sudo swapon /swapfile
+fi
 python3 -c "import ensurepip" 2>/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv; }
 python3 -m venv --system-site-packages .venv  # reuse the image's CUDA torch
 .venv/bin/pip install -q -r requirements.txt

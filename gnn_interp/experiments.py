@@ -73,9 +73,10 @@ def _free():
 def _isolated(fn, *args):
     """Run ``fn(*args)`` in a fresh (spawned) process, so a loaded model's host and GPU memory is fully released."""
     import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
 
-    with mp.get_context("spawn").Pool(1) as pool:
-        return pool.apply(fn, args)
+    with ProcessPoolExecutor(1, mp_context=mp.get_context("spawn")) as ex:
+        return ex.submit(fn, *args).result()  # raises BrokenProcessPool if the worker is killed (e.g. host OOM)
 
 
 def _read_jsonl(path: Path) -> list[dict]:
