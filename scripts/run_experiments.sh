@@ -8,7 +8,8 @@ set -euo pipefail
 DTYPE=${DTYPE:-bfloat16}  # float32 does not fit an L4 (24 GB): attribution OOMs
 # step name -> experiment + args. *_it steps (instruct model) are not in the default order: with the current
 # prompt the instruct model ignores the step format (2026-11-16); run them explicitly if the prompt changes.
-steps=(memory balance batch precision sizes gnn cv probe)
+# precision (fp32 vs bf16) needs > 24 GB: fp32 OOMs even in generation on an L4; run it on a larger GPU.
+steps=(memory balance batch sizes gnn cv probe)
 declare -A cmd=(
   [memory]="memory --out runs/memory"
   [balance]="balance --out runs/balance --n 70 --dtype $DTYPE"
