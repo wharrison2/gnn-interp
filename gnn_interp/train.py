@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -16,6 +17,7 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold
 from torch_geometric.loader import DataLoader
 
+from . import jsonl
 from .graph_data import DecoderPCA, FeatureNormalizer
 from .metrics import compute_metrics
 from .models import GraphClassifier
@@ -123,19 +125,27 @@ def holdout_split(groups, test_frac: float = 0.2, seed: int = 0) -> tuple[np.nda
     return next(split.split(np.zeros(len(groups)), groups=groups))
 
 
-def grouped_cv(y, groups, fit_predict: FitPredict, n_folds: int = 5,
-               seeds=range(5)) -> tuple[list[dict], dict[int, np.ndarray]]:
+def grouped_cv(y, groups, fit_predict: FitPredict, n_folds: int = 5, seeds=range(5),
+               checkpoint: Path | None = None) -> tuple[list[dict], dict[int, np.ndarray]]:
     """Stratified, problem-grouped k-fold CV repeated over ``seeds``.
 
-    Returns per-(seed, fold) metric rows and out-of-fold probabilities per seed.
+    Returns per-(seed, fold) metric rows and out-of-fold probabilities per seed. With ``checkpoint`` (a jsonl
+    file), each finished fold's test indices and probabilities are appended there, and folds already in it
+    are reused instead of refit (folds are deterministic given the seed), so an interrupted run resumes.
     """
     y, groups = np.asarray(y), np.asarray(groups)
+    saved = {(r["seed"], r["fold"]): r for r in jsonl.read(checkpoint)} if checkpoint else {}
     rows, oof = [], {}
     for seed in seeds:
         oof[seed] = np.full(len(y), np.nan)
         cv = StratifiedGroupKFold(n_folds, shuffle=True, random_state=seed)
         for fold, (tr, te) in enumerate(cv.split(np.zeros(len(y)), y, groups)):
-            p = fit_predict(tr, te, seed)
+            if (seed, fold) in saved and saved[(seed, fold)]["te"] == te.tolist():
+                p = np.asarray(saved[(seed, fold)]["p"])
+            else:
+                p = np.asarray(fit_predict(tr, te, seed))
+                if checkpoint:
+                    jsonl.append(checkpoint, {"seed": seed, "fold": fold, "te": te.tolist(), "p": p.tolist()})
             oof[seed][te] = p
             rows.append({"seed": seed, "fold": fold, **compute_metrics(y[te], p)})
     return rows, oof

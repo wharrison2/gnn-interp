@@ -41,4 +41,9 @@ Then run from the repo root (`from gnn_interp import ...`).
 ## GPU VM (Google Cloud)
 `scripts/`: `create_vm.sh` (local; 1x L4 VM, needs `PROJECT`), `setup_vm.sh` (on the VM from the repo root; needs
 `HF_TOKEN` in the environment or `.env`, which is gitignored), `run_experiments.sh` (all calibration experiments;
-optional `BUCKET` to sync `runs/`). Usage is in each script's header. Stop the VM when done.
+optional `BUCKET` to sync `runs/`). Usage is in each script's header.
+
+Spot VMs (`SPOT=1 create_vm.sh`): a preempted VM stops with its disk; a Cloud Scheduler job (`autostart.sh`)
+restarts it every 5 min, and `vm_startup.sh` re-enables swap and relaunches the interrupted step from
+`runs/.resume`. Steps resume from their jsonl rows (truncated last lines are dropped) and CV from finished folds.
+Delete with `delete_vm.sh` (removes the restart job first; otherwise it restarts a VM stopped on purpose).

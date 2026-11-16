@@ -10,6 +10,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv
 if ! swapon --show | grep -q /swapfile; then
   sudo fallocate -l 48G /swapfile && sudo chmod 600 /swapfile && sudo mkswap -q /swapfile && sudo swapon /swapfile
 fi
+grep -q /swapfile /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab > /dev/null  # survive reboots
 python3 -c "import ensurepip" 2>/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv; }
 python3 -m venv --system-site-packages .venv  # reuse the image's CUDA torch
 .venv/bin/pip install -q -r requirements.txt

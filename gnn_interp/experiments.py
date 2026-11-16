@@ -30,7 +30,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from . import attribution, gemma, problems
+from . import attribution, gemma, jsonl, problems
 from .graph_data import graph_to_data, type_dims
 
 DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}
@@ -79,13 +79,7 @@ def _isolated(fn, *args):
         return ex.submit(fn, *args).result()  # raises BrokenProcessPool if the worker is killed (e.g. host OOM)
 
 
-def _read_jsonl(path: Path) -> list[dict]:
-    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
-
-
-def _append_jsonl(path: Path, row: dict):
-    with path.open("a") as f:
-        f.write(json.dumps(row) + "\n")
+_read_jsonl, _append_jsonl = jsonl.read, jsonl.append  # interruption-safe (spot preemption)
 
 
 def _write_json(path: Path, obj):
@@ -176,8 +170,7 @@ def class_balance(model, out_dir: Path, n_per_level: int, levels=tuple(LEVELS),
                 "complete": rec.get("complete")})
             grades = attribution.label_record(rec, p, model.tokenizer)
             rows = [{**asdict(g), "pos": s["pos"]} for g, s in zip(grades, rec["steps"])] or [{"step_idx": None}]
-            for r in rows:
-                _append_jsonl(steps_path, {"problem_id": p.problem_id, "level": level, **r, **timing})
+            _append_jsonl(steps_path, *({"problem_id": p.problem_id, "level": level, **r, **timing} for r in rows))
     return summarize_balance(_read_jsonl(steps_path))
 
 
@@ -327,6 +320,7 @@ def graph_sizes(model, steps_dir: Path, out_dir: Path, n: int, max_feature_nodes
     rows_path, data_path = out_dir / "sizes.jsonl", out_dir / "data.pt"
     done = {(r["problem_id"], r["step_idx"]) for r in _read_jsonl(rows_path)}
     data = torch.load(data_path, weights_only=False) if data_path.exists() else []
+    data = [d for d in data if (d.problem_id, d.step_idx) in done]  # drop a graph saved just before an interruption
     token_classes = gemma.token_class_table(model.tokenizer) if save_data else None
     for step in sample_steps(_read_jsonl(steps_dir / "steps.jsonl"), n, seed):
         key = (step["problem_id"], step["step_idx"])
@@ -356,7 +350,7 @@ def graph_sizes(model, steps_dir: Path, out_dir: Path, n: int, max_feature_nodes
                                       node_mask=node_mask, edge_mask=edge_mask)
                     d.problem_id, d.step_idx, d.line, d.prev_line = key[0], key[1], rs["line"], rs["prev_line"]
                     data.append(d)
-                    torch.save(data, data_path)
+                    jsonl.save_atomic(data, data_path)
             else:
                 kept = _kept_feature_keys(graph)
                 stats["jaccard_vs_ref"] = _set_jaccard(kept, ref)
@@ -684,14 +678,19 @@ def gnn_epoch_timing(data_list, convs=("graphconv", "deepsets"), n_target: int =
 
 
 def cv_dry_run(data_list, conv: str = "graphconv", n_folds: int = 5, seeds=range(5),
-               device: str = "cuda" if torch.cuda.is_available() else "cpu", n_pca: int = 8) -> dict:
-    """One full grouped CV run: wall time, epochs to early stopping, and (meaningless at this size) metrics."""
+               device: str = "cuda" if torch.cuda.is_available() else "cpu", n_pca: int = 8,
+               checkpoint: Path | None = None) -> dict:
+    """One full grouped CV run: wall time, epochs to early stopping, and (meaningless at this size) metrics.
+
+    With ``checkpoint``, finished folds are saved there and skipped on a rerun (``wall_seconds`` and
+    ``epochs_run`` then cover only this run's folds).
+    """
     from .train import TrainConfig, grouped_cv, gnn_fit_predict, summarize
 
     fp = gnn_fit_predict(data_list, _model_kwargs(conv, n_pca), TrainConfig(device=device))
     y, groups = [d.y.item() for d in data_list], [d.problem_id for d in data_list]
     t = time.perf_counter()
-    rows, _ = grouped_cv(y, groups, fp, n_folds, seeds)
+    rows, _ = grouped_cv(y, groups, fp, n_folds, seeds, checkpoint)
     return {"conv": conv, "n_graphs": len(data_list), "n_incorrect": int(sum(y)), "device": device,
             "wall_seconds": time.perf_counter() - t, "epochs_run": _quantiles(fp.epochs),
             "metrics": summarize(rows)}
@@ -741,11 +740,11 @@ def main(argv=None):
             result = store_graphs(model, a.steps, a.out, a.keys, a.n, a.caps[0], a.batch_size)
         else:
             result, rows = step_confidence(model, a.steps)
-            for r in rows:
-                _append_jsonl(a.out / "confidence.jsonl", r)
+            (a.out / "confidence.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     else:
         data = torch.load(a.data, weights_only=False)
-        result = gnn_epoch_timing(data) if a.experiment == "gnn" else cv_dry_run(data, a.conv)
+        result = gnn_epoch_timing(data) if a.experiment == "gnn" else cv_dry_run(
+            data, a.conv, checkpoint=a.out / "cv_folds.jsonl")
     _write_json(a.out / "summary.json", result)
 
 

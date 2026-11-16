@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Calibration experiments (gnn_interp.experiments) in order, from the repo root. Each step logs to
-# runs/<step>.log; if BUCKET is set, runs/ is synced to $BUCKET/runs/<short hostname> after each step.
-# Rerunning resumes (balance/sizes skip finished rows). Run inside tmux. DTYPE (default bfloat16) is the
-# model precision for balance/batch/sizes.
+# runs/<step>.log; if BUCKET is set, runs/ is synced to $BUCKET/runs/<short hostname> every SYNC_MINUTES
+# (default 10) during a step and after it. Rerunning resumes (balance/sizes/store skip finished rows, cv
+# reuses finished folds). Run inside tmux. DTYPE (default bfloat16) is the model precision.
+# Preemption: runs/.resume records the current step and settings; scripts/vm_startup.sh relaunches from it
+# on boot. It is removed when the run finishes or a step fails (kept if the step was killed by a signal).
 # Usage: BUCKET=gs://my-bucket [SKIP="step ..."] bash scripts/run_experiments.sh [first_step]
 set -euo pipefail
 DTYPE=${DTYPE:-bfloat16}  # float32 does not fit an L4 (24 GB): attribution OOMs
@@ -25,12 +27,22 @@ declare -A cmd=(
   [probe]="probe --out runs/probe --steps runs/balance"
   [probe_it]="probe --out runs/probe_it --steps runs/balance_it"
 )
+push() { if [[ -n "${BUCKET:-}" ]]; then gcloud storage rsync -r runs "$BUCKET/runs/$(hostname -s)" --quiet; fi; }
+marker=runs/.resume
 started=0; first="${1:-memory}"
 for s in "${steps[@]}"; do
   [[ "$s" == "$first" ]] && started=1; [[ $started == 1 ]] || continue
   [[ " ${SKIP:-} " == *" $s "* ]] && { echo "=== skip $s"; continue; }
   echo "=== $s ($(date))"; mkdir -p runs
-  .venv/bin/python -m gnn_interp.experiments ${cmd[$s]} 2>&1 | tee "runs/$s.log"
-  if [[ -n "${BUCKET:-}" ]]; then gcloud storage rsync -r runs "$BUCKET/runs/$(hostname -s)" --quiet; fi
+  printf 'STEP=%q\nBUCKET=%q\nSKIP=%q\nDTYPE=%q\n' "$s" "${BUCKET:-}" "${SKIP:-}" "$DTYPE" > "$marker"
+  (while sleep $(( ${SYNC_MINUTES:-10} * 60 )); do push || true; done) & syncer=$!
+  set +e; .venv/bin/python -m gnn_interp.experiments ${cmd[$s]} 2>&1 | tee "runs/$s.log"; rc=${PIPESTATUS[0]}; set -e
+  kill $syncer 2>/dev/null || true
+  push || true
+  if (( rc != 0 )); then
+    (( rc < 128 )) && rm -f "$marker"  # >= 128: killed by a signal (e.g. preemption): keep the marker
+    echo "=== $s failed (exit $rc)"; exit "$rc"
+  fi
 done
-echo "all done. Stop the VM when finished."
+rm -f "$marker"; push
+echo "all done. Delete the VM when finished (scripts/delete_vm.sh)."
