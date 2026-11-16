@@ -118,3 +118,9 @@ def test_grade_incomplete_drops_last_line():
 def test_grade_rejects_bad_expression():
     with pytest.raises(ValueError):
         P.grade_steps("2 +", ["= 2"])
+
+
+def test_evaluate_thousands_separators():
+    assert P.evaluate("619,108 + 200,114 + 583") == 819805
+    assert P.evaluate("1,234,567 - 7") == 1234560
+    assert P.evaluate("12,34 + 1") is None  # not a thousands group

@@ -17,6 +17,7 @@ import ast
 import hashlib
 import json
 import random
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -179,8 +180,12 @@ def load_problems(path: str | Path) -> list[Problem]:
 # ---- grading ----
 
 def evaluate(expr: str) -> int | None:
-    """Value of an ``int``/``+ - *``/parentheses expression, or None if it isn't one."""
+    """Value of an ``int``/``+ - *``/parentheses expression, or None if it isn't one.
+
+    Thousands separators (``619,108``) are accepted: the model writes them for large numbers.
+    """
     expr = expr.replace("×", "*").replace("−", "-").strip().rstrip(".").strip()
+    expr = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", expr)
     try:
         return _eval_tree(_parse_tree(expr))
     except (ValueError, RecursionError):

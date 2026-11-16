@@ -181,6 +181,32 @@ def class_balance(model, out_dir: Path, n_per_level: int, levels=tuple(LEVELS),
     return summarize_balance(_read_jsonl(steps_path))
 
 
+def regrade(steps_dir: Path, seed: int = 0) -> dict:
+    """Recompute ``steps.jsonl`` labels from the saved records with the current grader (no generation).
+
+    Problems are regenerated from ``LEVELS`` and ``seed`` (IDs are deterministic); timing fields are kept.
+    The old file is kept as ``steps.jsonl.bak``.
+    """
+    path = steps_dir / "steps.jsonl"
+    old = _read_jsonl(path)
+    meta = {r["problem_id"]: (r["level"], {k: r[k] for k in ("seconds", "n_generated") if k in r}) for r in old}
+    probs = {p.problem_id: p for level in {lv for lv, _ in meta.values()}
+             for p in problems.generate_problems(sum(lv == level for lv, _ in meta.values()), seed=seed,
+                                                 **LEVELS[level])}
+    rows = []
+    for pid, (level, timing) in meta.items():
+        rec = torch.load(steps_dir / "records" / f"{pid}.pt", weights_only=False)
+        grades = problems.grade_steps(probs[pid].expression, [s["line"] for s in rec["steps"]],
+                                      complete=rec.get("complete", True))
+        rows += [{"problem_id": pid, "level": level, **asdict(g), "pos": s["pos"], **timing}
+                 for g, s in zip(grades, rec["steps"])] or [{"problem_id": pid, "level": level, "step_idx": None,
+                                                             **timing}]
+    path.rename(path.with_suffix(".jsonl.bak"))
+    for r in rows:
+        _append_jsonl(path, r)
+    return summarize_balance(rows)
+
+
 def summarize_balance(rows: list[dict]) -> dict:
     """Per level: problems, steps, labelled steps (up to the first error), incorrect count and rates.
 
@@ -559,7 +585,8 @@ def cv_dry_run(data_list, conv: str = "graphconv", n_folds: int = 5, seeds=range
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("experiment", choices=["memory", "balance", "batch", "precision", "sizes", "gnn", "cv", "probe"])
+    ap.add_argument("experiment",
+                    choices=["memory", "balance", "regrade", "batch", "precision", "sizes", "gnn", "cv", "probe"])
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--n", type=int, default=100, help="balance: problems per level; sizes: steps to attribute")
     ap.add_argument("--levels", nargs="+", default=list(LEVELS))
@@ -578,6 +605,8 @@ def main(argv=None):
         result = memory_fit(batch_size=a.batch_size)
     elif a.experiment == "precision":
         result = precision_check(a.steps, a.n, batch_size=a.batch_size)
+    elif a.experiment == "regrade":
+        result = regrade(a.steps)
     elif a.experiment == "probe":
         result = probe_baseline(a.steps)
     elif a.experiment in ("balance", "batch", "sizes"):

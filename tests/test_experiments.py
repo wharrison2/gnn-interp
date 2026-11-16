@@ -96,6 +96,11 @@ def test_balance_and_sizes_plumbing(tmp_path, monkeypatch):
     assert len(gens) == 3 and gens[0]["completion"] and gens[0]["answer"] == 6
     X, y, groups = experiments.load_resid(tmp_path / "bal")
     assert X.shape == (6, N_LAYERS + 1, 4) and y.sum() == 3 and len(set(groups)) == 3
+    # regrade reproduces the labels from the saved records and keeps timing
+    before = experiments._read_jsonl(tmp_path / "bal" / "steps.jsonl")
+    assert experiments.regrade(tmp_path / "bal")["easy"]["incorrect_steps"] == 3
+    after = experiments._read_jsonl(tmp_path / "bal" / "steps.jsonl")
+    assert [(r["label"], r["seconds"]) for r in after] == [(r["label"], r["seconds"]) for r in before]
     bs = experiments.batch_sweep(model, tmp_path / "bal", 2, batch_sizes=(8, 16), max_feature_nodes=12)
     assert set(bs) == {"8", "16"} and bs["8"]["oom"] == 0 and bs["8"]["seconds"] >= 0
     sizes = experiments.graph_sizes(model, tmp_path / "bal", tmp_path / "sizes", 4,
