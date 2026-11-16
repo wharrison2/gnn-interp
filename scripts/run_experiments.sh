@@ -9,13 +9,15 @@ DTYPE=${DTYPE:-bfloat16}  # float32 does not fit an L4 (24 GB): attribution OOMs
 # step name -> experiment + args. *_it steps (instruct model) are not in the default order: with the current
 # prompt the instruct model ignores the step format (2026-11-16); run them explicitly if the prompt changes.
 # precision (fp32 vs bf16) needs > 24 GB: fp32 OOMs even in generation on an L4; run it on a larger GPU.
-steps=(memory balance batch sizes gnn cv probe)
+steps=(memory balance batch sizes store confidence gnn cv probe)
 declare -A cmd=(
   [memory]="memory --out runs/memory"
   [balance]="balance --out runs/balance --n 70 --dtype $DTYPE"
   [balance_it]="balance --out runs/balance_it --n 70 --dtype $DTYPE --model instruct"
   [batch]="batch --out runs/batch --steps runs/balance --n 5 --dtype $DTYPE"
   [precision]="precision --out runs/precision --steps runs/balance --n 10"
+  [store]="store --out runs/store --steps runs/balance --keys runs/sizes/sizes.jsonl --caps 4096 --dtype $DTYPE"
+  [confidence]="confidence --out runs/confidence --steps runs/balance --dtype $DTYPE"
   [sizes]="sizes --out runs/sizes --steps runs/balance --n 40 --caps 4096 2048 --dtype $DTYPE"  # ~34 s/graph at 4096
   [sizes_it]="sizes --out runs/sizes_it --steps runs/balance_it --n 30 --caps 4096 --dtype $DTYPE --model instruct"
   [gnn]="gnn --out runs/gnn --data runs/sizes/data.pt"

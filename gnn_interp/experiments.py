@@ -486,6 +486,111 @@ def _precision_one(dtype: str, steps, batch_size: int, max_feature_nodes: int, m
 
 
 # --------------------------------------------------------------------------------------------
+# 2c. Storing graphs (compact) and checking determinism; model-confidence baseline
+# --------------------------------------------------------------------------------------------
+
+def store_graphs(model, steps_dir: Path, out_dir: Path, keys_from: Path | None = None, n: int = 40,
+                 max_feature_nodes: int = 4096, batch_size: int = 64, n_repeat: int = 3) -> dict:
+    """Attribute steps and save each graph compactly (``attribution.save_compact``) to ``out_dir/graphs``.
+
+    Steps: those in ``keys_from`` (a jsonl with ``problem_id``/``step_idx``, e.g. ``sizes.jsonl``), else
+    ``sample_steps(n)``. Determinism: the first ``n_repeat`` graphs are built twice and their adjacency
+    matrices compared; if ``keys_from`` has ``by_cap`` stats, node count and replacement score are compared too.
+    Resumable (``store.jsonl``).
+    """
+    from circuit_tracer.graph import compute_graph_scores
+
+    rows_path, graph_dir = out_dir / "store.jsonl", out_dir / "graphs"
+    graph_dir.mkdir(parents=True, exist_ok=True)
+    all_steps = {(r["problem_id"], r["step_idx"]): r for r in _read_jsonl(steps_dir / "steps.jsonl")}
+    if keys_from:
+        prior = {(r["problem_id"], r["step_idx"]): r for r in _read_jsonl(keys_from)}
+        steps = [all_steps[k] for k in prior]
+    else:
+        prior, steps = {}, sample_steps(list(all_steps.values()), n)
+    done = {(r["problem_id"], r["step_idx"]) for r in _read_jsonl(rows_path)}
+    for i, step in enumerate(steps):
+        key = (step["problem_id"], step["step_idx"])
+        if key in done:
+            continue
+        tokens = torch.load(steps_dir / "records" / f"{key[0]}.pt", weights_only=False)["tokens"]
+        build = lambda: attribution.build_graph(model, tokens, step["pos"], max_feature_nodes=max_feature_nodes,  # noqa: E731
+                                                batch_size=batch_size)
+        t = time.perf_counter()
+        graph = build()
+        row = {"problem_id": key[0], "step_idx": key[1], "level": step["level"], "label": step["label"],
+               "seconds": time.perf_counter() - t, "n_nodes": graph.adjacency_matrix.shape[0],
+               "replacement_score": compute_graph_scores(graph)[0],
+               "top1_prob": float(graph.logit_probabilities[0])}
+        path = graph_dir / f"{key[0]}__{key[1]}.pt"
+        attribution.save_compact(graph, path)
+        row["compact_mb"] = path.stat().st_size / 1e6
+        if key in prior and "4096" in prior[key].get("by_cap", {}):
+            ref = prior[key]["by_cap"][str(max_feature_nodes)]
+            row["same_as_prior"] = {"n_nodes": row["n_nodes"] == ref["n_nodes"],
+                                    "replacement_score_diff": abs(row["replacement_score"] - ref["replacement_score"])}
+        if i < n_repeat:
+            a = graph.adjacency_matrix.cpu()
+            del graph
+            _free()
+            b = build().adjacency_matrix.cpu()
+            row["repeat"] = {"same_shape": a.shape == b.shape}
+            if a.shape == b.shape:
+                row["repeat"] |= {"identical": bool(torch.equal(a, b)),
+                                  "max_abs_diff": float((a - b).abs().max()),
+                                  "rel_diff": float((a - b).norm() / a.norm())}
+        _free()
+        _append_jsonl(rows_path, row)
+        print(row, flush=True)
+    rows = _read_jsonl(rows_path)
+    prior_rows = [r["same_as_prior"] for r in rows if "same_as_prior" in r]
+    return {"n_graphs": len(rows), "seconds": _quantiles([r["seconds"] for r in rows]),
+            "compact_mb": _quantiles([r["compact_mb"] for r in rows]),
+            "total_gb": sum(r["compact_mb"] for r in rows) / 1e3,
+            "repeat": [r["repeat"] for r in rows if "repeat" in r],
+            "vs_prior": {"n": len(prior_rows), "same_n_nodes": _mean([p["n_nodes"] for p in prior_rows]),
+                         "max_replacement_score_diff": max((p["replacement_score_diff"] for p in prior_rows),
+                                                           default=float("nan"))}}
+
+
+@torch.no_grad()
+def step_confidence(model, steps_dir: Path) -> tuple[dict, list[dict]]:
+    """Model confidence at every labelled step, and how well it predicts errors (AUROC, no training).
+
+    Per step: probability of the generated final token (the graph's logit target), its entropy and top-1/top-2
+    margin, and the minimum probability over the step line's generated tokens. Returns (summary, rows).
+    """
+    from sklearn.metrics import roc_auc_score
+
+    rows, by_problem = [], {}
+    for r in _read_jsonl(steps_dir / "steps.jsonl"):
+        if r.get("label") is not None:
+            by_problem.setdefault(r["problem_id"], []).append(r)
+    for pid, steps in by_problem.items():
+        tokens = torch.load(steps_dir / "records" / f"{pid}.pt", weights_only=False)["tokens"]
+        logp = model(tokens[None].to(model.cfg.device))[0].float().log_softmax(-1).cpu()  # (n_pos, vocab)
+        for st in steps:
+            p = st["pos"]
+            lp = logp[p - 1]
+            start = p
+            while start > 1 and "\n" not in model.tokenizer.decode(tokens[start - 1]):
+                start -= 1
+            line_p = logp[torch.arange(start - 1, p), tokens[start:p + 1]].exp()
+            top2 = lp.topk(2).values.exp()
+            rows.append({"problem_id": pid, "step_idx": st["step_idx"], "level": st["level"], "label": st["label"],
+                         "p_final": float(lp[tokens[p]].exp()), "entropy": float(-(lp.exp() * lp).sum()),
+                         "margin": float(top2[0] - top2[1]), "p_min_line": float(line_p.min())})
+    y = np.array([r["label"] for r in rows])
+    out = {"n": len(rows), "incorrect": int(y.sum())}
+    for k, sign in (("p_final", -1), ("entropy", 1), ("margin", -1), ("p_min_line", -1)):
+        v = sign * np.array([r[k] for r in rows])
+        no_easy = np.array([r["level"] != "easy" for r in rows])
+        out[k] = {"auroc": float(roc_auc_score(y, v)), "auroc_no_easy": float(roc_auc_score(y[no_easy], v[no_easy])),
+                  "mean_correct": float(sign * v[y == 0].mean()), "mean_incorrect": float(sign * v[y == 1].mean())}
+    return out, rows
+
+
+# --------------------------------------------------------------------------------------------
 # 3b. Residual-stream probe (CPU; on the residuals saved by ``class_balance``)
 # --------------------------------------------------------------------------------------------
 
@@ -599,12 +704,14 @@ def cv_dry_run(data_list, conv: str = "graphconv", n_folds: int = 5, seeds=range
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("experiment",
-                    choices=["memory", "balance", "regrade", "batch", "precision", "sizes", "gnn", "cv", "probe"])
+                    choices=["memory", "balance", "regrade", "batch", "precision", "sizes", "store", "confidence", "gnn",
+                             "cv", "probe"])
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--n", type=int, default=100, help="balance: problems per level; sizes: steps to attribute")
     ap.add_argument("--levels", nargs="+", default=list(LEVELS))
     ap.add_argument("--steps", type=Path, help="batch/precision/sizes/probe: the balance output directory")
     ap.add_argument("--data", type=Path, help="gnn/cv: data.pt written by sizes")
+    ap.add_argument("--keys", type=Path, help="store: jsonl of steps to attribute (e.g. sizes.jsonl)")
     ap.add_argument("--dtype", default="float32", choices=list(DTYPES))
     ap.add_argument("--model", default="base", choices=list(gemma.MODELS), help="balance/batch/sizes: base or instruct")
     ap.add_argument("--caps", type=int, nargs="+", default=[8192, 4096, 2048], help="sizes: max_feature_nodes")
@@ -622,14 +729,20 @@ def main(argv=None):
         result = regrade(a.steps)
     elif a.experiment == "probe":
         result = probe_baseline(a.steps)
-    elif a.experiment in ("balance", "batch", "sizes"):
+    elif a.experiment in ("balance", "batch", "sizes", "store", "confidence"):
         model = gemma.load_model("cuda" if _cuda() else None, DTYPES[a.dtype], gemma.MODELS[a.model])
         if a.experiment == "balance":
             result = class_balance(model, a.out, a.n, a.levels)
         elif a.experiment == "batch":
             result = batch_sweep(model, a.steps, a.n, a.batch_sizes)
-        else:
+        elif a.experiment == "sizes":
             result = graph_sizes(model, a.steps, a.out, a.n, a.caps, a.batch_size)
+        elif a.experiment == "store":
+            result = store_graphs(model, a.steps, a.out, a.keys, a.n, a.caps[0], a.batch_size)
+        else:
+            result, rows = step_confidence(model, a.steps)
+            for r in rows:
+                _append_jsonl(a.out / "confidence.jsonl", r)
     else:
         data = torch.load(a.data, weights_only=False)
         result = gnn_epoch_timing(data) if a.experiment == "gnn" else cv_dry_run(data, a.conv)
