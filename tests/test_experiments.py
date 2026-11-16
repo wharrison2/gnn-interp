@@ -108,6 +108,17 @@ def test_balance_and_sizes_plumbing(tmp_path, monkeypatch):
     assert sizes["n_graphs"] == 4 and "jaccard_vs_ref" in sizes["6"]
     data = torch.load(tmp_path / "sizes" / "data.pt", weights_only=False)
     assert len(data) == 4 and sum(int(d.y.item()) for d in data) == 2
+    # an out-of-memory cap is recorded and excluded, not raised
+    def oom_build_graph(model, tokens, pos, max_feature_nodes, **kw):
+        if max_feature_nodes == 99:
+            raise torch.OutOfMemoryError("fake")
+        return fake_build_graph(model, tokens, pos, max_feature_nodes)
+
+    monkeypatch.setattr(attribution, "build_graph", oom_build_graph)
+    o = experiments.graph_sizes(model, tmp_path / "bal", tmp_path / "sizes_oom", 2, max_feature_nodes=(12, 99),
+                                save_data=False)
+    assert o == {"n_graphs": 0, "n_oom": 2}
+    monkeypatch.setattr(attribution, "build_graph", fake_build_graph)
     # rerun resumes: nothing new is attributed
     assert experiments.graph_sizes(model, tmp_path / "bal", tmp_path / "sizes", 4,
                                    max_feature_nodes=(12, 6))["n_graphs"] == 4

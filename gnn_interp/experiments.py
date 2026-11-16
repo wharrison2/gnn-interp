@@ -339,7 +339,12 @@ def graph_sizes(model, steps_dir: Path, out_dir: Path, n: int, max_feature_nodes
         for cap in max_feature_nodes:
             _reset_peak()
             t = time.perf_counter()
-            graph = attribution.build_graph(model, tokens, pos, max_feature_nodes=cap, batch_size=batch_size)
+            try:
+                graph = attribution.build_graph(model, tokens, pos, max_feature_nodes=cap, batch_size=batch_size)
+            except torch.OutOfMemoryError:
+                _free()
+                row["oom"] = cap
+                break  # recorded, so a rerun skips it; excluded from the summary
             stats = {"seconds": time.perf_counter() - t, "peak_gb": _peak_gb(), **graph_stats(graph)}
             if ref is None:
                 ref = _kept_feature_keys(graph)
@@ -359,14 +364,22 @@ def graph_sizes(model, steps_dir: Path, out_dir: Path, n: int, max_feature_nodes
             del graph
             _free()
         _append_jsonl(rows_path, row)
-        print({k: row[k] for k in ("problem_id", "step_idx", "label")},
+        print({k: row[k] for k in ("problem_id", "step_idx", "label")}, row.get("oom", ""),
               {c: round(s["seconds"], 1) for c, s in row["by_cap"].items()})
     return summarize_sizes(_read_jsonl(rows_path))
 
 
 def summarize_sizes(rows: list[dict]) -> dict:
-    """Per ``max_feature_nodes`` cap: time, memory, unpruned size, and pruned size per threshold."""
-    out = {"n_graphs": len(rows), "top1_is_generated": float(np.mean([r["top1_is_generated"] for r in rows]))}
+    """Per ``max_feature_nodes`` cap: time, memory, unpruned size, and pruned size per threshold.
+
+    Steps with an out-of-memory error at any cap are counted (``n_oom``) and excluded.
+    """
+    n_oom = sum("oom" in r for r in rows)
+    rows = [r for r in rows if "oom" not in r]
+    if not rows:
+        return {"n_graphs": 0, "n_oom": n_oom}
+    out = {"n_graphs": len(rows), "n_oom": n_oom,
+           "top1_is_generated": float(np.mean([r["top1_is_generated"] for r in rows]))}
     for cap in rows[0]["by_cap"]:
         s = [r["by_cap"][cap] for r in rows]
         out[cap] = {k: _quantiles([x[k] for x in s])
