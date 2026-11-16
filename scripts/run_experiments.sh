@@ -3,7 +3,7 @@
 # runs/<step>.log; if BUCKET is set, runs/ is synced to $BUCKET/runs/<short hostname> after each step.
 # Rerunning resumes (balance/sizes skip finished rows). Run inside tmux. DTYPE (default bfloat16) is the
 # model precision for balance/batch/sizes.
-# Usage: BUCKET=gs://my-bucket bash scripts/run_experiments.sh [first_step]
+# Usage: BUCKET=gs://my-bucket [SKIP="step ..."] bash scripts/run_experiments.sh [first_step]
 set -euo pipefail
 DTYPE=${DTYPE:-bfloat16}  # float32 does not fit an L4 (24 GB): attribution OOMs
 # step name -> experiment + args; *_it steps repeat balance/sizes/probe on the instruct model (smaller sizes run)
@@ -24,6 +24,7 @@ declare -A cmd=(
 started=0; first="${1:-memory}"
 for s in "${steps[@]}"; do
   [[ "$s" == "$first" ]] && started=1; [[ $started == 1 ]] || continue
+  [[ " ${SKIP:-} " == *" $s "* ]] && { echo "=== skip $s"; continue; }
   echo "=== $s ($(date))"; mkdir -p runs
   .venv/bin/python -m gnn_interp.experiments ${cmd[$s]} 2>&1 | tee "runs/$s.log"
   if [[ -n "${BUCKET:-}" ]]; then gcloud storage rsync -r runs "$BUCKET/runs/$(hostname -s)" --quiet; fi
